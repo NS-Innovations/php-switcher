@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1 — 2026-10-21
+
+- Fixed: the ionCube check missed encoded files that do not contain the text "ionCube" (encoder
+  options can leave the loader message out), so a switch went ahead and `php-switch check`
+  reported nothing. Every .php file under the document roots is now compiled with the version's
+  loader (`php -l`, no code runs) and the files the loader refuses are reported. This takes about
+  25 seconds for a FusionPBX install on two CPUs.
+
 ## 1.3.0 — 2026-10-21
 
 - FusionPBX servers: when `/usr/src/fusionpbx-install.sh` is present (or `FUSIONPBX_INSTALL_DIR`

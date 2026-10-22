@@ -171,9 +171,10 @@ Steps 1–4 change nothing that serves traffic. A failure from step 5 on rolls e
   changed, and checks the encoded files against it.
 - **ionCube-encoded files** only load on the PHP versions their encoder supports: files encoded for
   PHP 8.1 run only on 8.1, files from the PHP 8.2–8.4 encoders run on 8.2 to 8.5, and files for
-  PHP 7.x run up to 7.4. Before switching, every encoded file under the web server's document roots
+  PHP 7.x run up to 7.4. Before switching, every `.php` file under the web server's document roots
   (and any lint directories) is test-loaded with the new version — `php -l` compiles it through the
-  loader without running it. If a file that works today would stop working, the switch stops before
+  loader without running it. All files are checked, because an encoded file cannot always be
+  recognised by its contents; for a FusionPBX install this takes about 25 seconds. If a file that works today would stop working, the switch stops before
   the live server changes and names the file and the versions it does load on. The fix is a copy
   encoded for the new version from the file's vendor; `--allow-ioncube-mismatch` switches anyway.
   The health check reports encoded files the running version cannot load.

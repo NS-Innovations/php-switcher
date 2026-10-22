@@ -60,7 +60,7 @@ fi
 set -o errexit -o errtrace -o nounset -o pipefail
 
 #set defaults
-	php_switch_version=1.3.0
+	php_switch_version=1.3.1
 	backup_root=/var/backups/php-switch
 	ui_conf=${PHP_SWITCH_CONF:-/etc/php-switch.conf}
 	assume_yes=false
@@ -894,7 +894,8 @@ EOF
 		done
 	}
 
-#.php files that look ionCube-encoded (php -l decides whether they really are)
+#.php files that mention ionCube; only a hint, used when a version has no loader to ask, because
+#encoder options can leave the "ionCube Loader" text out of an encoded file entirely
 	encoded_files() {
 		local dir
 		while read -r dir; do
@@ -919,45 +920,63 @@ EOF
 		echo "${list# }"
 	}
 
-#encoded files that one version cannot load; prints "file<TAB>message" and returns their number
-	ioncube_problems() {
-		local v=$1 file err count=0
-		while read -r file; do
-			[ -n "$file" ] || continue
-			err=$(ioncube_error "$v" "$file")
-			if [ -n "$err" ]; then
-				printf '%s\t%s\n' "$file" "$err"
-				count=$((count + 1))
-			fi
-		done < <(encoded_files)
-		return $count
+#every .php file under the scan directories that a version's ionCube loader refuses, as
+#"file<TAB>message". Each file is compiled with php -l, which runs none of its code. Every file is
+#checked because an encoded file cannot be recognised reliably by its contents.
+	ioncube_refused() {
+		local v=$1 dir
+		has_ioncube "$v" || return 0
+		while read -r dir; do
+			# shellcheck disable=SC2016 # $0 and $1 belong to the sh -c script
+			find "$dir" -name '*.php' -type f -not -path '*/node_modules/*' -print0 \
+				| xargs -0 -r -n 1 -P "$(nproc 2>/dev/null || echo 2)" sh -c '
+					out=$("$0" -l "$1" 2>&1 | grep -E "ionCube (PHP )?(Encoder|Loader)" | grep -v "^No syntax errors" | head -n 1)
+					if [ -n "$out" ]; then printf "%s\t%s\n" "$1" "$out"; fi' "$(cli_bin "$v")"
+		done < <(encoded_dirs) | sort -u | sed 's/\tPHP Fatal error: */\t/; s/ in Unknown on line 0$//'
 	}
 
-#before a switch: stop when the target cannot load encoded files the source loads
+#the scan directories as one line, for messages
+	encoded_dirs_line() {
+		local dirs
+		dirs=$(encoded_dirs | paste -sd ' ')
+		echo "${dirs:-no document roots found}"
+	}
+
+#files a version's loader refuses; prints "file<TAB>message" and returns their number
+	ioncube_problems() {
+		local refused
+		refused=$(ioncube_refused "$1")
+		[ -n "$refused" ] || return 0
+		echo "$refused"
+		return "$(grep -c . <<< "$refused")"
+	}
+
+#before a switch: stop when the target refuses files the source loads
 	check_ioncube() {
-		local from=$1 to=$2 files file err count=0 runs
-		files=$(encoded_files)
-		[ -n "$files" ] || return 0
+		local from=$1 to=$2 refused file err count=0 runs hint
+		if ! has_ioncube "$from" && ! has_ioncube "$to"; then return 0; fi
 		if ! has_ioncube "$to"; then
-			if has_ioncube "$from"; then
-				fail "php $to has no ionCube loader, and $(grep -c . <<< "$files") file(s) look ionCube-encoded"
+			hint=$(encoded_files)
+			if [ -n "$hint" ]; then
+				fail "php $to has no ionCube loader, and $(grep -c . <<< "$hint") file(s) mention ionCube, for example $(head -n 1 <<< "$hint")"
 				count=1
 			fi
 		else
-			while read -r file; do
-				err=$(ioncube_error "$to" "$file")
-				[ -n "$err" ] || continue
-				if [ -n "$(ioncube_error "$from" "$file")" ]; then
-					warn "fails on php $from too: $file: $err"
+			info "test-loading every .php file under $(encoded_dirs_line) with php $to's ionCube loader"
+			refused=$(ioncube_refused "$to")
+			while IFS=$'\t' read -r file err; do
+				[ -n "$file" ] || continue
+				if has_ioncube "$from" && [ -n "$(ioncube_error "$from" "$file")" ]; then
+					warn "refused by php $from too: $file: $err"
 					continue
 				fi
 				runs=$(ioncube_runs_on "$to" "$file")
 				fail "$file cannot load on php $to (it loads on php ${runs:-$from}): $err"
 				count=$((count + 1))
-			done <<< "$files"
+			done <<< "$refused"
 		fi
 		if [ "$count" -eq 0 ]; then
-			ok "ionCube: $(grep -c . <<< "$files") encoded file(s) load on php $to"
+			if has_ioncube "$to"; then ok "ionCube: php $to's loader accepts every .php file"; fi
 			return 0
 		fi
 		if $allow_ioncube_mismatch; then
@@ -1354,22 +1373,25 @@ EOF
 	}
 
 	cmd_check() {
-		local v failures=0 url code versions file err runs
+		local v failures=0 url code versions file err runs ioncube_failures
 		versions=$(running_fpm_versions)
 		[ -n "$versions" ] || info "no php-fpm running"
 		for v in $versions; do
 			step "php $v ($(fpm_service "$v"))"
 			probe_pools "$v" || failures=$((failures + $?))
-			while IFS=$'\t' read -r file err; do
-				[ -n "$file" ] || continue
-				runs=$(ioncube_runs_on "$v" "$file")
-				fail "$file cannot load on php $v${runs:+ (it loads on php $runs)}: $err"
-				failures=$((failures + 1))
-			done < <(ioncube_problems "$v" || true)
+			if has_ioncube "$v"; then
+				info "test-loading every .php file under $(encoded_dirs_line) with php $v's ionCube loader"
+				ioncube_failures=0
+				while IFS=$'\t' read -r file err; do
+					[ -n "$file" ] || continue
+					runs=$(ioncube_runs_on "$v" "$file")
+					fail "$file cannot load on php $v${runs:+ (it loads on php $runs)}: $err"
+					ioncube_failures=$((ioncube_failures + 1))
+				done < <(ioncube_problems "$v" || true)
+				if [ "$ioncube_failures" -eq 0 ]; then ok "php $v's ionCube loader accepts every .php file"; fi
+				failures=$((failures + ioncube_failures))
+			fi
 		done
-		if [ -n "$versions" ] && [ "$failures" -eq 0 ] && [ -n "$(encoded_files)" ]; then
-			ok "ionCube-encoded files load on php $(paste -sd ' ' <<< "$versions")"
-		fi
 		for url in "${check_urls[@]}"; do
 			code=$(http_code "$url")
 			if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then ok "$url -> $code"; else fail "$url -> $code"; failures=$((failures + 1)); fi
@@ -1400,7 +1422,7 @@ EOF
 			probe_pools "$v" || die "$(fpm_service "$v") does not answer after the reload"
 			ok "$(fpm_service "$v") reloaded gracefully"
 		fi
-		step "ionCube-encoded files on php $v"
+		step "test-loading every .php file under $(encoded_dirs_line) with php $v"
 		while IFS=$'\t' read -r file err; do
 			[ -n "$file" ] || continue
 			runs=$(ioncube_runs_on "$v" "$file")
@@ -1411,7 +1433,7 @@ EOF
 			warn "a new loader cannot fix this: these files were encoded for another php version; get copies for php $v from their vendor"
 			return 1
 		fi
-		if [ -n "$(encoded_files)" ]; then ok "every encoded file loads on php $v"; else info "no ionCube-encoded files under the document roots"; fi
+		ok "php $v's ionCube loader accepts every .php file under $(encoded_dirs_line)"
 	}
 
 #resolve "latest" or check an explicit version, adding the repository when it is needed
@@ -1555,8 +1577,7 @@ EOF
 			if $apache_conf; then echo "  apache: a2disconf php$from-fpm, a2enconf php$target-fpm"; fi
 			if $apache_mod; then echo "  apache: a2dismod php$from, a2enmod php$target"; fi
 			if $switch_cli; then echo "  /usr/bin/php: php $cli_before -> php $target"; fi
-			v=$(encoded_files | grep -c . || true)
-			if [ "$v" -gt 0 ]; then echo "  ionCube: $v file(s) look encoded; each is test-loaded with php $target before anything changes"; fi
+			if has_ioncube "$from"; then echo "  ionCube: every .php file under $(encoded_dirs_line) is test-loaded with php $target before anything changes"; fi
 			if [ -n "$dep_report" ]; then echo "  processes running php:"; printf '%s' "$dep_report" | sed 's/^/    /'; fi
 			echo
 			if $dry_run; then return 0; fi

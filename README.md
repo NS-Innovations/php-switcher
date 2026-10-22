@@ -62,7 +62,7 @@ sudo php-switch
 ```
 
 ```
-php-switch 1.1.0 on Debian GNU/Linux 12 (bookworm), using packages.sury.org.
+php-switch 1.2.0 on Debian GNU/Linux 12 (bookworm), using packages.sury.org.
 Running php-fpm: 8.2. The php command: php 8.2.
 Main menu:
   1. Switch PHP version
@@ -120,7 +120,7 @@ php-switch version
 ```
 
 `switch` options: `--yes`, `--dry-run`, `--from x.y`, `--lint DIR`, `--check-url URL`,
-`--allow-prerelease`, `--allow-missing-ext`, `--no-restart`. `latest` means the newest stable
+`--allow-prerelease`, `--allow-missing-ext`, `--allow-ioncube-mismatch`, `--no-restart`. `latest` means the newest stable
 version; release candidates are only used with `--allow-prerelease`.
 
 ```
@@ -133,7 +133,7 @@ sudo php-switch switch latest --yes --check-url https://example.com/login.php --
 1. Check the PHP repository and its signing key, repairing a broken key.
 2. Install the target version with the same extension packages.
 3. Carry over `php.ini`, `php-fpm.conf`, pool and `conf.d` changes, systemd drop-ins and ionCube.
-4. Validate: `php-fpm -t`, startup warnings, extension parity, optional lint.
+4. Validate: `php-fpm -t`, startup warnings, extension parity, ionCube-encoded files, optional lint.
 5. Start the new PHP-FPM beside the old one and probe each pool over FastCGI.
 6. Point the web server at the new sockets, test its config, reload it.
 7. Switch the `php` command.
@@ -157,6 +157,14 @@ Steps 1–4 change nothing that serves traffic. A failure from step 5 on rolls e
   `opcache`, `lexbor` and `uri` in 8.5) and are not reported as missing.
 - **ionCube loaders** are downloaded from ioncube.com when the server already uses ionCube. Set
   `IONCUBE_DIR` to a directory of loaders to use local copies instead.
+- **ionCube-encoded files** only load on the PHP versions their encoder supports: files encoded for
+  PHP 8.1 run only on 8.1, files from the PHP 8.2–8.4 encoders run on 8.2 to 8.5, and files for
+  PHP 7.x run up to 7.4. Before switching, every encoded file under the web server's document roots
+  (and any lint directories) is test-loaded with the new version — `php -l` compiles it through the
+  loader without running it. If a file that works today would stop working, the switch stops before
+  the live server changes and names the file and the versions it does load on. The fix is a copy
+  encoded for the new version from the file's vendor; `--allow-ioncube-mismatch` switches anyway.
+  The health check reports encoded files the running version cannot load.
 - **Backups** of every file a switch changes are kept in `/var/backups/php-switch/<timestamp>/`.
 
 ## Files it touches

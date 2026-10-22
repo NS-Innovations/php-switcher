@@ -29,6 +29,7 @@
 #   --check-url URL       must still answer below 500 (and below 400 if it did before); repeatable
 #   --allow-prerelease    let a version resolve to an alpha / beta / RC build
 #   --allow-missing-ext   continue when the target lacks extensions the current version loads
+#   --allow-ioncube-mismatch  continue when ionCube-encoded files would stop loading on the target
 #   --no-restart          leave systemd units and supervisor programs alone
 #
 # A switch, in order. Steps 1-4 change nothing that serves traffic; a failure from step 5 on rolls
@@ -36,7 +37,7 @@
 #   1. check the php repository and its signing key, repairing a missing, expired or broken key
 #   2. install the target version with the same set of extension packages
 #   3. carry over php.ini, php-fpm.conf, pool and conf.d changes, systemd drop-ins and ionCube
-#   4. validate: php-fpm -t, startup warnings, extension parity, optional lint
+#   4. validate: php-fpm -t, startup warnings, extension parity, ionCube-encoded files, optional lint
 #   5. start the target php-fpm beside the current one and probe every pool over FastCGI; a pool
 #      whose address has no version in it is handed over instead: the old php-fpm stops just
 #      before the new one starts
@@ -57,7 +58,7 @@ fi
 set -o errexit -o errtrace -o nounset -o pipefail
 
 #set defaults
-	php_switch_version=1.1.0
+	php_switch_version=1.2.0
 	backup_root=/var/backups/php-switch
 	ui_conf=${PHP_SWITCH_CONF:-/etc/php-switch.conf}
 	assume_yes=false
@@ -65,6 +66,7 @@ set -o errexit -o errtrace -o nounset -o pipefail
 	check_only=false
 	allow_prerelease=false
 	allow_missing_ext=false
+	allow_ioncube_mismatch=false
 	restart_dependents=true
 	from_arg=''
 	lint_dirs=()
@@ -771,6 +773,106 @@ EOF
 		systemctl daemon-reload
 	}
 
+#--- ionCube-encoded files ----------------------------------------------------------------------
+
+#A file encoded for one PHP version only loads on the PHP versions its encoder supports: files for
+#PHP 8.1 run only on 8.1, files for 8.2-8.4 run on 8.2 to 8.5, files for 7.x run up to 7.4. The
+#loader checks this when it compiles a file, so php -l tests it without running any of the file's
+#code.
+
+#document roots the web servers serve
+	web_roots() {
+		local server file
+		if has nginx; then
+			{ nginx -T 2>/dev/null || true; } | awk '$1 == "root" { r = $2; sub(/;$/, "", r); gsub(/"/, "", r); print r }'
+		fi
+		while IFS=$'\t' read -r server file; do
+			[[ "$server" = apache && -f "$file" ]] || continue
+			awk 'tolower($1) == "documentroot" { r = $2; gsub(/"/, "", r); print r }' "$file"
+		done < <(web_config_files)
+	}
+
+#directories to search for encoded files: the document roots and the lint directories
+	encoded_dirs() {
+		local dir
+		{ web_roots; printf '%s\n' "${lint_dirs[@]}"; } | sort -u | while read -r dir; do
+			if [ -n "$dir" ] && [ -d "$dir" ]; then echo "$dir"; fi
+		done
+	}
+
+#.php files that look ionCube-encoded (php -l decides whether they really are)
+	encoded_files() {
+		local dir
+		while read -r dir; do
+			find "$dir" -name '*.php' -type f -not -path '*/node_modules/*' -print0 \
+				| xargs -0 -r -n 200 grep -l -a -m 1 -E 'ionCube|ICB0' 2>/dev/null || true
+		done < <(encoded_dirs) | sort -u
+	}
+
+	has_ioncube() { "$(cli_bin "$1")" -v 2>&1 | grep 'ionCube' >/dev/null; }
+
+#the loader's complaint when a version compiles a file, or nothing when it loads
+	ioncube_error() {
+		"$(cli_bin "$1")" -l "$2" 2>&1 | grep -v '^No syntax errors' | grep -E 'ionCube (PHP )?(Encoder|Loader)' | head -n 1 | sed 's/^PHP Fatal error: *//; s/ in Unknown on line 0$//' || true
+	}
+
+#installed versions with ionCube that load a file
+	ioncube_runs_on() {
+		local v list=''
+		for v in $(installed_versions); do
+			if has_ioncube "$v" && [ -z "$(ioncube_error "$v" "$2")" ]; then list="$list $v"; fi
+		done
+		echo "${list# }"
+	}
+
+#encoded files that one version cannot load; prints "file<TAB>message" and returns their number
+	ioncube_problems() {
+		local v=$1 file err count=0
+		while read -r file; do
+			[ -n "$file" ] || continue
+			err=$(ioncube_error "$v" "$file")
+			if [ -n "$err" ]; then
+				printf '%s\t%s\n' "$file" "$err"
+				count=$((count + 1))
+			fi
+		done < <(encoded_files)
+		return $count
+	}
+
+#before a switch: stop when the target cannot load encoded files the source loads
+	check_ioncube() {
+		local from=$1 to=$2 files file err count=0 runs
+		files=$(encoded_files)
+		[ -n "$files" ] || return 0
+		if ! has_ioncube "$to"; then
+			if has_ioncube "$from"; then
+				fail "php $to has no ionCube loader, and $(grep -c . <<< "$files") file(s) look ionCube-encoded"
+				count=1
+			fi
+		else
+			while read -r file; do
+				err=$(ioncube_error "$to" "$file")
+				[ -n "$err" ] || continue
+				if [ -n "$(ioncube_error "$from" "$file")" ]; then
+					warn "fails on php $from too: $file: $err"
+					continue
+				fi
+				runs=$(ioncube_runs_on "$to" "$file")
+				fail "$file cannot load on php $to (it loads on php ${runs:-$from}): $err"
+				count=$((count + 1))
+			done <<< "$files"
+		fi
+		if [ "$count" -eq 0 ]; then
+			ok "ionCube: $(grep -c . <<< "$files") encoded file(s) load on php $to"
+			return 0
+		fi
+		if $allow_ioncube_mismatch; then
+			warn "continuing anyway (--allow-ioncube-mismatch); those files will fail on php $to"
+			return 0
+		fi
+		die "ionCube-encoded files above would stop working on php $to. Ask their vendor for files encoded for php $to (the PHP 8.2-8.4 encoders cover PHP 8.2 to 8.5), or stay on php $from. The live server was not changed."
+	}
+
 #--- validation ---------------------------------------------------------------------------------
 
 #startup complaints from the cli and php-fpm
@@ -844,6 +946,7 @@ EOF
 		else
 			ok "extensions match php $from"
 		fi
+		check_ioncube "$from" "$to"
 		for dir in "${lint_dirs[@]}"; do
 			count=$(find "$dir" -name '*.php' -not -path '*/node_modules/*' | wc -l)
 			regressions=''
@@ -1157,13 +1260,22 @@ EOF
 	}
 
 	cmd_check() {
-		local v failures=0 url code versions
+		local v failures=0 url code versions file err runs
 		versions=$(running_fpm_versions)
 		[ -n "$versions" ] || info "no php-fpm running"
 		for v in $versions; do
 			step "php $v ($(fpm_service "$v"))"
 			probe_pools "$v" || failures=$((failures + $?))
+			while IFS=$'\t' read -r file err; do
+				[ -n "$file" ] || continue
+				runs=$(ioncube_runs_on "$v" "$file")
+				fail "$file cannot load on php $v${runs:+ (it loads on php $runs)}: $err"
+				failures=$((failures + 1))
+			done < <(ioncube_problems "$v" || true)
 		done
+		if [ -n "$versions" ] && [ "$failures" -eq 0 ] && [ -n "$(encoded_files)" ]; then
+			ok "ionCube-encoded files load on php $(paste -sd ' ' <<< "$versions")"
+		fi
 		for url in "${check_urls[@]}"; do
 			code=$(http_code "$url")
 			if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then ok "$url -> $code"; else fail "$url -> $code"; failures=$((failures + 1)); fi
@@ -1312,6 +1424,8 @@ EOF
 			if $apache_conf; then echo "  apache: a2disconf php$from-fpm, a2enconf php$target-fpm"; fi
 			if $apache_mod; then echo "  apache: a2dismod php$from, a2enmod php$target"; fi
 			if $switch_cli; then echo "  /usr/bin/php: php $cli_before -> php $target"; fi
+			v=$(encoded_files | grep -c . || true)
+			if [ "$v" -gt 0 ]; then echo "  ionCube: $v file(s) look encoded; each is test-loaded with php $target before anything changes"; fi
 			if [ -n "$dep_report" ]; then echo "  processes running php:"; printf '%s' "$dep_report" | sed 's/^/    /'; fi
 			echo
 			if $dry_run; then return 0; fi
@@ -1835,6 +1949,7 @@ EOF
 			--check-url) check_urls+=("${2:?--check-url needs a url}"); shift ;;
 			--allow-prerelease) allow_prerelease=true ;;
 			--allow-missing-ext) allow_missing_ext=true ;;
+			--allow-ioncube-mismatch) allow_ioncube_mismatch=true ;;
 			--no-restart) restart_dependents=false ;;
 			-h|--help) command=help ;;
 			-*) die "unknown option $1" ;;

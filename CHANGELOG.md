@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0 — 2026-10-21
+
+- New check for ionCube-encoded files. A file encoded for PHP 8.1 runs only on 8.1, so switching
+  from 8.1 to 8.4 left such files failing with "Only files produced by either the PHP 8.2 or 8.3 or
+  8.4 ionCube Encoders can run on PHP 8.4 or 8.5". Before switching, every encoded file under the
+  document roots and lint directories is now test-loaded with the new version (`php -l`, which
+  compiles through the loader without running the file). The switch stops before the live server
+  changes if a file would stop loading, and names the versions it does load on.
+  `--allow-ioncube-mismatch` overrides. The switch also stops if the new version has no ionCube
+  loader while encoded files are present.
+- The health check (menu and `php-switch check`) reports encoded files the running version cannot
+  load, with the versions they do load on.
+
 ## 1.1.0 — 2026-10-21
 
 - The menu is now line-based: numbered choices, plain prompts, and results between headings, with

@@ -62,7 +62,7 @@ sudo php-switch
 ```
 
 ```
-php-switch 1.2.0 on Debian GNU/Linux 12 (bookworm), using packages.sury.org.
+php-switch 1.3.0 on Debian GNU/Linux 12 (bookworm), using packages.sury.org.
 Running php-fpm: 8.2. The php command: php 8.2.
 Main menu:
   1. Switch PHP version
@@ -71,9 +71,10 @@ Main menu:
   4. Health check
   5. Repository and signing key
   6. Versions available to install
-  7. Settings
-  8. Quit
-Main menu. Choose 1 to 8, or press Enter to hear the choices again:
+  7. Regenerate the ionCube loader
+  8. Settings
+  9. Quit
+Main menu. Choose 1 to 9, or press Enter to hear the choices again:
 ```
 
 Type a number and press Enter. In lists, 0 goes back. Results start with a `== Title` line and end
@@ -87,6 +88,7 @@ with `== End of Title.`, so you always know where one finishes.
 | Health check | probe every PHP-FPM pool, plus any URLs you give |
 | Repository and signing key | check only, or check and repair; add the repository if it is missing |
 | Versions available to install | everything apt can install, prereleases marked |
+| Regenerate the ionCube loader | reinstall the loader for a PHP version, then check the encoded files against it |
 | Settings | default check URLs, lint directories, and whether to restart services |
 
 When switching you can type the version itself (`8.4`) instead of its number. Then it asks:
@@ -114,6 +116,7 @@ php-switch status
 php-switch list
 php-switch services
 php-switch check [--check-url URL]
+php-switch ioncube [x.y]
 php-switch repo [--check]
 php-switch switch <x.y|latest> [options]
 php-switch version
@@ -157,6 +160,15 @@ Steps 1–4 change nothing that serves traffic. A failure from step 5 on rolls e
   `opcache`, `lexbor` and `uri` in 8.5) and are not reported as missing.
 - **ionCube loaders** are downloaded from ioncube.com when the server already uses ionCube. Set
   `IONCUBE_DIR` to a directory of loaders to use local copies instead.
+- **ionCube loader on FusionPBX servers**: when `/usr/src/fusionpbx-install.sh` (or
+  `$FUSIONPBX_INSTALL_DIR`) is present, the loader is generated with its `resources/ioncube.sh`,
+  as the FusionPBX installer does, for every version that script has a section for; otherwise it
+  is downloaded from ioncube.com. The script runs from a scratch copy of its directory with
+  `php_version` set to the target, so the install repository is not modified. Its php-fpm restart
+  is skipped, and the loader file is replaced rather than overwritten in place, because
+  overwriting a loader that a running php-fpm has loaded crashes it. `php-switch ioncube [x.y]`
+  (or the menu) regenerates the loader on demand, reloads php-fpm gracefully only if the loader
+  changed, and checks the encoded files against it.
 - **ionCube-encoded files** only load on the PHP versions their encoder supports: files encoded for
   PHP 8.1 run only on 8.1, files from the PHP 8.2–8.4 encoders run on 8.2 to 8.5, and files for
   PHP 7.x run up to 7.4. Before switching, every encoded file under the web server's document roots

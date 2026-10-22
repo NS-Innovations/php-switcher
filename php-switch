@@ -18,6 +18,8 @@
 #   repo [--check]               check the php repository and its signing key; repairs unless --check
 #   services                     systemd units and supervisor programs running php, and what a switch does to them
 #   check [--check-url URL]      probe every pool of the running php-fpm over FastCGI
+#   ioncube [x.y]                regenerate the ionCube loader (with FusionPBX's install script when
+#                                it is there) and check the encoded files against it
 #   switch <x.y|latest> [opts]   install if needed, then live switch
 #   version                      print the php-switch version
 #
@@ -58,7 +60,7 @@ fi
 set -o errexit -o errtrace -o nounset -o pipefail
 
 #set defaults
-	php_switch_version=1.2.0
+	php_switch_version=1.3.0
 	backup_root=/var/backups/php-switch
 	ui_conf=${PHP_SWITCH_CONF:-/etc/php-switch.conf}
 	assume_yes=false
@@ -711,19 +713,78 @@ EOF
 		done
 	}
 
-#ionCube loader for the target when the source uses it
-	install_ioncube() {
-		local from=$1 to=$2 sapi ini_name='' ext_dir loader source tmp='' arch f
+#the conf.d file that loads ionCube for a version, if any
+	ioncube_ini_name() {
+		local sapi f
 		for sapi in fpm cli; do
-			for f in "$(confd "$from" "$sapi")"/*.ini; do
-				if [ -f "$f" ] && grep -iE '^[ \t]*zend_extension.*ioncube' "$f" >/dev/null; then ini_name=$(basename "$f"); fi
+			for f in "$(confd "$1" "$sapi")"/*.ini; do
+				if [ -f "$f" ] && grep -iE '^[ \t]*zend_extension.*ioncube' "$f" >/dev/null; then
+					basename "$f"
+					return 0
+				fi
 			done
 		done
-		[ -n "$ini_name" ] || return 0
-		if "$(cli_bin "$to")" -v 2>&1 | grep 'ionCube' >/dev/null; then
-			ok "ionCube already loads on php $to"
-			return 0
+		return 0
+	}
+
+#FusionPBX servers installed with fusionpbx-install.sh set the loader up with that script's
+#resources/ioncube.sh; this finds it for this distro
+	fusionpbx_ioncube_script() {
+		local dir=${FUSIONPBX_INSTALL_DIR:-/usr/src/fusionpbx-install.sh} family=debian
+		if [ "$repo_kind" = ondrej ]; then family=ubuntu; fi
+		if [ -f "$dir/$family/resources/ioncube.sh" ] && [ -f "$dir/$family/resources/config.sh" ]; then
+			echo "$dir/$family/resources/ioncube.sh"
 		fi
+		return 0
+	}
+
+#generate the loader with FusionPBX's ioncube.sh. It runs from a scratch copy of its directory
+#(links to the real files, and a config.sh with php_version set to this version) because it
+#deletes and re-downloads the ioncube directory beside it and reads the version from config.sh.
+#Two of its commands get stand-ins: "service php-fpm restart" does nothing, because a hard restart
+#drops requests (the caller reloads php-fpm gracefully, and only when the loader changed), and cp
+#replaces the loader file instead of overwriting it in place, which crashes a php-fpm that has
+#the old file mapped.
+	ioncube_from_install_script() {
+		local v=$1 script dir tmp f rc=0 loader
+		script=$(fusionpbx_ioncube_script)
+		[ -n "$script" ] || return 1
+		if ! grep -F "\"\$php_version\" = .\"$v\"" "$script" >/dev/null; then
+			info "$script has no section for php $v"
+			return 1
+		fi
+		dir=$(dirname "$script")
+		has wget || pkg_install wget
+		loader=$("$(cli_bin "$v")" -n -r 'echo ini_get("extension_dir");')/ioncube_loader_lin_$v.so
+		tmp=$(mktemp -d)
+		touch "$tmp/started"
+		mkdir "$tmp/bin"
+		printf '#!/bin/sh\nexit 0\n' > "$tmp/bin/service"
+		printf '#!/bin/sh\nexec %s --remove-destination "$@"\n' "$(command -v cp)" > "$tmp/bin/cp"
+		chmod 755 "$tmp/bin/service" "$tmp/bin/cp"
+		for f in "$dir"/*; do
+			case "$(basename "$f")" in
+				config.sh|ioncube|ioncube_loaders_lin_*.zip|bin) ;;
+				*) ln -s "$f" "$tmp/" ;;
+			esac
+		done
+		sed "s/^php_version=.*/php_version=$v/" "$dir/config.sh" > "$tmp/config.sh"
+		info "running $script for php $v"
+		(cd "$tmp" && PATH="$tmp/bin:$PATH" sh ./ioncube.sh) < /dev/null > "$tmp/ioncube.log" 2>&1 || rc=$?
+		#the script ran properly if it wrote the loader file after it started
+		if [ -z "$(find "$loader" -newer "$tmp/started" 2>/dev/null)" ] || ! has_ioncube "$v"; then
+			warn "$(basename "$script") did not install a working loader for php $v (exit $rc); its output:"
+			tail -n 15 "$tmp/ioncube.log" | sed 's/^/         /' >&2
+			rm -rf "$tmp"
+			return 1
+		fi
+		rm -rf "$tmp"
+		return 0
+	}
+
+#download the loader from ioncube.com and load it through the given conf.d file name
+	ioncube_download() {
+		local to=$1 ini_name=$2 ext_dir loader source tmp='' arch sapi
 		ext_dir=$("$(cli_bin "$to")" -n -r 'echo ini_get("extension_dir");')
 		loader=ioncube_loader_lin_$to.so
 		source=${IONCUBE_DIR:-/nonexistent}/$loader
@@ -731,7 +792,7 @@ EOF
 			case "$(uname -m)" in
 				x86_64) arch=x86-64 ;;
 				aarch64) arch=aarch64 ;;
-				*) warn "no ionCube loader download for $(uname -m)"; return 0 ;;
+				*) warn "no ionCube loader download for $(uname -m)"; return 1 ;;
 			esac
 			has unzip || pkg_install unzip
 			tmp=$(mktemp -d)
@@ -741,7 +802,7 @@ EOF
 			else
 				warn "no ionCube loader for php $to yet; ionCube-encoded files will not run on it"
 				rm -rf "$tmp"
-				return 0
+				return 1
 			fi
 		fi
 		install -m 644 "$source" "$ext_dir/$loader"
@@ -749,12 +810,45 @@ EOF
 		for sapi in fpm cli; do
 			echo "zend_extension = $ext_dir/$loader" > "$(confd "$to" "$sapi")/$ini_name"
 		done
-		if "$(cli_bin "$to")" -v 2>&1 | grep 'ionCube' >/dev/null; then
-			ok "ionCube $("$(cli_bin "$to")" -v | grep -oE 'ionCube PHP Loader v[0-9.]+' || true)"
-		else
-			warn "the ionCube loader does not load on php $to; removed"
-			for sapi in fpm cli; do rm -f "$(confd "$to" "$sapi")/$ini_name"; done
+		if has_ioncube "$to"; then return 0; fi
+		warn "the ionCube loader does not load on php $to; removed"
+		for sapi in fpm cli; do rm -f "$(confd "$to" "$sapi")/$ini_name"; done
+		return 1
+	}
+
+#a checksum of the ionCube conf.d files of a version and the loaders they name
+	ioncube_fingerprint() {
+		local sapi f so
+		for sapi in fpm cli; do
+			for f in "$(confd "$1" "$sapi")"/*.ini; do
+				if [ ! -f "$f" ] || ! grep -iE '^[ \t]*zend_extension.*ioncube' "$f" >/dev/null; then continue; fi
+				cat "$f"
+				so=$(sed -n 's/^[ \t]*zend_extension[ \t]*=[ \t]*"\{0,1\}\([^"]*\)"\{0,1\}[ \t]*$/\1/p' "$f" | head -n 1)
+				if [ -f "$so" ]; then md5sum < "$so"; fi
+			done
+		done | md5sum | cut -d' ' -f1
+	}
+
+#(re)generate the loader for a version: FusionPBX's ioncube.sh when it is there, else a download
+	generate_ioncube() {
+		local v=$1 ini_name=${2:-00-ioncube.ini}
+		if ioncube_from_install_script "$v" || ioncube_download "$v" "$ini_name"; then
+			ok "$("$(cli_bin "$v")" -v | grep -oE 'ionCube PHP Loader v[0-9.]+' || echo 'the ionCube loader') loads on php $v"
+			return 0
 		fi
+		return 1
+	}
+
+#ionCube loader for the target when the source uses it
+	install_ioncube() {
+		local from=$1 to=$2 ini_name
+		ini_name=$(ioncube_ini_name "$from")
+		[ -n "$ini_name" ] || return 0
+		if has_ioncube "$to"; then
+			ok "ionCube already loads on php $to"
+			return 0
+		fi
+		generate_ioncube "$to" "$ini_name" || true
 	}
 
 #systemd drop-ins of the source php-fpm unit
@@ -1281,6 +1375,43 @@ EOF
 			if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then ok "$url -> $code"; else fail "$url -> $code"; failures=$((failures + 1)); fi
 		done
 		return $failures
+	}
+
+#regenerate the ionCube loader for a version (the running one by default), then check the
+#encoded files against it
+	cmd_ioncube() {
+		local v=${1:-} file err runs problems=0 before
+		[ "$(id -u)" = 0 ] || die "ioncube needs root"
+		if [ -z "$v" ]; then v=$(running_fpm_versions | tail -n 1); fi
+		if [ -z "$v" ]; then v=$(default_cli_version); fi
+		[ -x "$(cli_bin "$v")" ] || die "php $v is not installed"
+		step "regenerating the ionCube loader for php $v"
+		if [ -n "$(fusionpbx_ioncube_script)" ]; then
+			info "FusionPBX install script found: $(fusionpbx_ioncube_script)"
+		fi
+		before=$(ioncube_fingerprint "$v")
+		generate_ioncube "$v" "$(ioncube_ini_name "$v")" || die "could not set up the ionCube loader for php $v"
+		if [ "$(ioncube_fingerprint "$v")" = "$before" ]; then
+			ok "the loader and its settings are unchanged; $(fpm_service "$v") left alone"
+		elif systemctl is-active --quiet "$(fpm_service "$v")"; then
+			systemctl reload "$(fpm_service "$v")"
+			sleep 1
+			wait_pools "$v"
+			probe_pools "$v" || die "$(fpm_service "$v") does not answer after the reload"
+			ok "$(fpm_service "$v") reloaded gracefully"
+		fi
+		step "ionCube-encoded files on php $v"
+		while IFS=$'\t' read -r file err; do
+			[ -n "$file" ] || continue
+			runs=$(ioncube_runs_on "$v" "$file")
+			fail "$file cannot load on php $v${runs:+ (it loads on php $runs)}: $err"
+			problems=$((problems + 1))
+		done < <(ioncube_problems "$v" || true)
+		if [ "$problems" -gt 0 ]; then
+			warn "a new loader cannot fix this: these files were encoded for another php version; get copies for php $v from their vendor"
+			return 1
+		fi
+		if [ -n "$(encoded_files)" ]; then ok "every encoded file loads on php $v"; else info "no ionCube-encoded files under the document roots"; fi
 	}
 
 #resolve "latest" or check an explicit version, adding the repository when it is needed
@@ -1871,6 +2002,20 @@ EOF
 		esac
 	}
 
+	ui_ioncube() {
+		local v
+		v=$(running_fpm_versions | tail -n 1)
+		[ -n "$v" ] || v=$(default_cli_version)
+		if [ -n "$(fusionpbx_ioncube_script)" ]; then
+			echo "The loader is generated with FusionPBX's install script, $(fusionpbx_ioncube_script)."
+		else
+			echo "The loader is downloaded from ioncube.com."
+		fi
+		ask "PHP version to regenerate the loader for, or 0 to go back" "$v" || return 0
+		[ "$reply" != 0 ] || return 0
+		ui_do "ionCube loader for php $reply" cmd_ioncube "$reply"
+	}
+
 	ui_settings() {
 		local rc=0
 		echo
@@ -1903,6 +2048,7 @@ EOF
 					check "Health check" \
 					repo "Repository and signing key" \
 					versions "Versions available to install" \
+					ioncube "Regenerate the ionCube loader" \
 					settings "Settings" \
 					quit "Quit"
 				show=false
@@ -1920,11 +2066,12 @@ EOF
 				check) ui_check ;;
 				repo) ui_repo ;;
 				versions) ui_do "Versions available to install" cmd_list ;;
+				ioncube) ui_ioncube ;;
 				settings) ui_settings ;;
 				quit) break ;;
 				*) echo "$reply is not a choice."; show=true ;;
 			esac
-			ui_keys=(switch status services check repo versions settings quit)
+			ui_keys=(switch status services check repo versions ioncube settings quit)
 		done
 		echo "Goodbye."
 	}
@@ -1975,9 +2122,10 @@ EOF
 		repo) cmd_repo ;;
 		services) cmd_services ;;
 		check) cmd_check ;;
+		ioncube) cmd_ioncube "$version_arg" ;;
 		switch)
 			[ -n "$version_arg" ] || die "usage: php-switch switch <x.y|latest> [options]"
 			cmd_switch "$version_arg"
 			;;
-		*) die "unknown command $command (menu, status, list, repo, services, check, switch, version)" ;;
+		*) die "unknown command $command (menu, status, list, repo, services, check, ioncube, switch, version)" ;;
 	esac

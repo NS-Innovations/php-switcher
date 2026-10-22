@@ -82,7 +82,7 @@ set -o nounset -o pipefail
 	fi
 
 #read-only menu flows; main menu: 1 switch, 2 status, 3 services, 4 check, 5 repo, 6 versions,
-#7 settings, 8 quit
+#7 ionCube loader, 8 settings, 9 quit
 	echo "menu"
 	cli_before=$(readlink -f /usr/bin/php 2>/dev/null || echo none)
 	has_repo=true
@@ -90,7 +90,7 @@ set -o nounset -o pipefail
 		has_repo=false
 	fi
 
-	menu 8
+	menu 9
 	expect "main menu lists its choices" "  1. Switch PHP version"
 	expect "main menu states what is running" "Running php-fpm:"
 	expect_clean "quit with 8"
@@ -101,30 +101,34 @@ set -o nounset -o pipefail
 	menu
 	expect_clean "end of input quits"
 
-	menu 99 8
+	menu 99 9
 	expect "an unknown choice is named" "99 is not a choice."
 	expect_clean "unknown choice"
 
-	menu "" 8
-	expect "Enter lists the choices again" "  8. Quit"
+	menu "" 9
+	expect "Enter lists the choices again" "  9. Quit"
 	expect_clean "Enter repeats the menu"
 
-	menu 2 8
+	menu 2 9
 	expect "status heading" "== Status"
 	expect "status content" "installed:"
 	expect "status end heading" "== End of Status."
 	expect_clean "status"
 
-	menu 3 8
+	menu 3 9
 	expect "services heading" "== Services and programs that run PHP"
 	expect "services content" "default cli:"
 	expect_clean "services"
 
-	menu 6 8
+	menu 6 9
 	expect "versions heading" "== Versions available to install"
 	expect_clean "versions"
 
-	menu 4 none 8
+	menu 7 0 9
+	expect "ionCube loader screen" "The loader is "
+	expect_clean "ionCube loader: 0 goes back"
+
+	menu 4 none 9
 	expect "health check heading" "== Health check"
 	expect_clean "health check"
 
@@ -132,7 +136,7 @@ set -o nounset -o pipefail
 	expect "repository check heading" "== Repository check"
 	expect_clean "repository check"
 
-	menu 7 http://127.0.0.1/ /srv/www no 8
+	menu 8 http://127.0.0.1/ /srv/www no 9
 	if grep -Fx 'check_urls="http://127.0.0.1/"' "$PHP_SWITCH_CONF" >/dev/null \
 		&& grep -Fx 'lint_dirs="/srv/www"' "$PHP_SWITCH_CONF" >/dev/null \
 		&& grep -Fx 'restart_dependents="off"' "$PHP_SWITCH_CONF" >/dev/null; then
@@ -142,7 +146,7 @@ set -o nounset -o pipefail
 		sed 's/^/         /' "$PHP_SWITCH_CONF"
 	fi
 	expect_clean "settings"
-	menu 7 none none yes 8
+	menu 8 none none yes 9
 	if grep -Fx 'check_urls=""' "$PHP_SWITCH_CONF" >/dev/null && grep -Fx 'restart_dependents="on"' "$PHP_SWITCH_CONF" >/dev/null; then
 		pass "settings: none clears a list"
 	else
@@ -164,7 +168,7 @@ set -o nounset -o pipefail
 		skip "switch flow: several php-fpm are running"
 	else
 		#switch, [repository], version, restart, urls, lint, missing extensions, apply, quit
-		menu 1 "${repo_answer[@]}" "$target" yes none none no no 8
+		menu 1 "${repo_answer[@]}" "$target" yes none none no no 9
 		expect "switch: version list" "Versions apt can install:"
 		expect "switch: plan heading" "== Plan"
 		expect "switch: plan names the target" "-> php $target"
@@ -176,7 +180,7 @@ set -o nounset -o pipefail
 			fail "switch declined: /usr/bin/php changed"
 		fi
 
-		menu 1 "${repo_answer[@]}" 0 8
+		menu 1 "${repo_answer[@]}" 0 9
 		expect_clean "switch: 0 goes back"
 	fi
 
@@ -184,7 +188,7 @@ set -o nounset -o pipefail
 	if $do_switch && [ -n "$target" ] && [ "$running_count" -le 1 ]; then
 		echo "switch (changes this machine)"
 		for version in "$target" "$active"; do
-			menu 1 "$version" yes none none no yes 8
+			menu 1 "$version" yes none none no yes 9
 			expect "switch to $version: plan" "== Plan"
 			expect "switch to $version: finished" "== End of Switching to php $version."
 			expect_clean "switch to $version"

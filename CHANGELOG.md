@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0 — 2026-10-21
+
+- FusionPBX servers: when `/usr/src/fusionpbx-install.sh` is present (or `FUSIONPBX_INSTALL_DIR`
+  points at it), the ionCube loader is generated with its `resources/ioncube.sh`, the same way the
+  FusionPBX installer does it. Versions the script has no section for (such as 8.5) fall back to
+  the download from ioncube.com. The script runs from a scratch copy so the install repository is
+  left untouched, its php-fpm restart is skipped, and its `cp` replaces the loader file instead of
+  overwriting it in place (overwriting a loaded loader crashed php-fpm in testing).
+- New `php-switch ioncube [x.y]` command and menu item: regenerate the loader for a version, reload
+  php-fpm gracefully only when the loader or its settings changed, then check the encoded files.
+
 ## 1.2.0 — 2026-10-21
 
 - New check for ionCube-encoded files. A file encoded for PHP 8.1 runs only on 8.1, so switching

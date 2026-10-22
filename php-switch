@@ -4,6 +4,8 @@
 #
 # Run it with no arguments for the menu. Every function is there: switching versions, status, the
 # services that run PHP, health checks, and checking or repairing the PHP repository and its key.
+# The menu is line by line (numbered choices, plain prompts, nothing redrawn), so it works with
+# screen readers and braille displays. NO_COLOR=1 turns colors off.
 #
 # Uses packages.sury.org on Debian and ppa:ondrej/php on Ubuntu (and their derivatives), adding the
 # repository when needed and repairing a missing, expired or broken signing key. Needs bash 4,
@@ -55,10 +57,9 @@ fi
 set -o errexit -o errtrace -o nounset -o pipefail
 
 #set defaults
-	php_switch_version=1.0.0
+	php_switch_version=1.1.0
 	backup_root=/var/backups/php-switch
 	ui_conf=${PHP_SWITCH_CONF:-/etc/php-switch.conf}
-	whiptail=${PHP_SWITCH_WHIPTAIL:-whiptail}
 	assume_yes=false
 	dry_run=false
 	check_only=false
@@ -80,12 +81,13 @@ set -o errexit -o errtrace -o nounset -o pipefail
 			c_ok=''; c_warn=''; c_err=''; c_dim=''; c_off=''
 		fi
 	}
-	if [ -t 1 ]; then set_colors on; else set_colors off; fi
+	if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then set_colors on; else set_colors off; fi
 
 #output helpers
-	step() { echo "${c_dim}==>${c_off} $*"; }
+	step_marker='==> '
+	step() { echo "${c_dim}${step_marker}${c_off}$*"; }
 	ok() { echo "  ${c_ok}ok${c_off}   $*"; }
-	info() { echo "  ${c_dim}--${c_off}   $*"; }
+	info() { echo "  ${c_dim}note${c_off} $*"; }
 	warn() { echo "  ${c_warn}warn${c_off} $*" >&2; }
 	fail() { echo "  ${c_err}FAIL${c_off} $*" >&2; }
 	die() { echo "${c_err}error:${c_off} $*" >&2; exit 1; }
@@ -800,12 +802,22 @@ EOF
 
 #php-fpm -t, startup warnings (disabling carried keys that cause them), extension parity, lint
 	validate_target() {
-		local from=$1 to=$2 target_fpm=$3 issues key file missing dir regressions count
+		local from=$1 to=$2 target_fpm=$3 issues key file missing dir regressions count sapi
 		if $target_fpm; then
 			if ! "$(fpm_bin "$to")" -t >/dev/null 2>&1; then "$(fpm_bin "$to")" -t >&2 || true; die "php-fpm$to -t failed"; fi
 			ok "php-fpm$to -t"
 		fi
 		issues=$(startup_issues "$to")
+		if grep -F 'JIT is incompatible with third party extensions' <<< "$issues" >/dev/null; then
+			for sapi in fpm cli; do
+				printf '%s\n' \
+					'; written by php-switch: JIT cannot run alongside an extension that installs its own opcode' \
+					'; handlers (ionCube, for example), and PHP was disabling it at every start anyway' \
+					'opcache.jit = disable' > "$(confd "$to" "$sapi")/99-php-switch-jit.ini"
+			done
+			warn "JIT cannot run alongside an extension with its own opcode handlers (ionCube); set opcache.jit = disable in conf.d/99-php-switch-jit.ini"
+			issues=$(startup_issues "$to")
+		fi
 		if [ -n "$issues" ] && [ -n "$carried_keys" ]; then
 			while IFS=$'\t' read -r file key; do
 				[ -n "$key" ] || continue
@@ -1481,21 +1493,20 @@ EOF
 
 #--- interactive menu ---------------------------------------------------------------------------
 
-#run a command in a subshell with errexit on, recording its status in sub_rc; never call this as
-#part of && / || or as an if condition, because bash then ignores errexit (and the rollback trap)
-#for everything inside it
+#A line-by-line interface: numbered choices, plain prompts, output printed in order. Nothing is
+#drawn, redrawn or cleared, so it reads naturally in a screen reader (Orca, speakup, NVDA or JAWS
+#over SSH), on a braille display, and on any terminal. Headings mark where each result starts and
+#ends.
+
+#run a command in a subshell with errexit on, recording its status in sub_rc; never call this, or
+#anything that calls it, as part of && / || or as an if condition, because bash then ignores
+#errexit (and the rollback trap) for everything inside it
 	sub_rc=0
 	run_sub() {
 		set +o errexit
 		( set -o errexit; "$@" )
 		sub_rc=$?
 		set -o errexit
-	}
-
-#run a command with colors off, for output shown in a text box
-	plain() {
-		set_colors off
-		"$@"
 	}
 
 #menu settings in /etc/php-switch.conf: check_urls, lint_dirs, restart_dependents (on/off)
@@ -1525,63 +1536,81 @@ restart_dependents="$ui_restart"
 EOF
 	}
 
-#whiptail with the selection on stdout
-	wt() {
-		"$whiptail" --backtitle "php-switch $php_switch_version  |  $os_name  |  $(repo_label)" "$@" 3>&1 1>&2 2>&3
+#ask a question; the answer is in $reply, the default is used for an empty answer; returns 1 at
+#the end of input
+	ask() {
+		local prompt=$1 default=${2:-}
+		if [ -n "$default" ]; then prompt="$prompt [$default]"; fi
+		if ! IFS= read -r -p "$prompt: " reply; then
+			echo
+			return 1
+		fi
+		reply=${reply#"${reply%%[![:space:]]*}"}
+		reply=${reply%"${reply##*[![:space:]]}"}
+		if [ -z "$reply" ]; then reply=$default; fi
+		return 0
 	}
 
-#box sizes from the terminal
-	ui_size() {
-		local lines cols
-		lines=$(tput lines 2>/dev/null || echo 24)
-		cols=$(tput cols 2>/dev/null || echo 80)
-		ui_h=$(( lines - 4 ))
-		ui_w=$(( cols - 8 ))
-		[ "$ui_h" -ge 16 ] || ui_h=16
-		[ "$ui_w" -ge 60 ] || ui_w=60
-		[ "$ui_w" -le 110 ] || ui_w=110
+#yes or no; returns 0 for yes, 1 for no, 2 at the end of input
+	ask_yes_no() {
+		while true; do
+			ask "$1 Yes or no" "$2" || return 2
+			case "${reply,,}" in
+				y|yes) return 0 ;;
+				n|no) return 1 ;;
+			esac
+			echo "Please answer yes or no."
+		done
 	}
 
-#show a file in a text box; only output too long for the box scrolls, because whiptail's
-#scrolling box keeps the focus on the text and Enter alone no longer closes it
-	ui_textbox() {
-		local title=$1 file=$2
-		if [ "$(wc -l < "$file")" -gt $(( ui_h - 7 )) ]; then
-			wt --title "$title  (arrows scroll, Tab then Enter closes)" --scrolltext --textbox "$file" "$ui_h" "$ui_w" || true
-		else
-			wt --title "$title" --textbox "$file" "$ui_h" "$ui_w" || true
+#a list of words, where "none" clears the default
+	ask_list() {
+		ask "$1 Separate several with spaces, or type none" "${2:-none}" || return 1
+		if [ "${reply,,}" = none ]; then reply=''; fi
+		reply=$(tr -d '"' <<< "$reply")
+		return 0
+	}
+
+#print a numbered list: the arguments alternate key and label; sets ui_keys
+	ui_list() {
+		local i=0
+		ui_keys=()
+		while [ $# -gt 0 ]; do
+			i=$((i + 1))
+			ui_keys+=("$1")
+			echo "  $i. $2"
+			shift 2
+		done
+	}
+
+#map a numbered answer to its key; sets $choice
+	ui_pick() {
+		choice=''
+		if [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le "${#ui_keys[@]}" ]; then
+			choice=${ui_keys[$(($1 - 1))]}
 		fi
 	}
 
-#show a command's output in a text box
-	ui_show() {
-		local title=$1 out
-		shift
-		out=$(mktemp)
-		run_sub plain "$@" > "$out" 2>&1
-		ui_textbox "$title" "$out"
-		rm -f "$out"
-	}
-
-#run a command on the plain terminal so its progress streams, then wait for Enter
-	ui_run() {
+#run an action with headings around its output
+	ui_do() {
 		local title=$1
 		shift
-		clear 2>/dev/null || true
-		echo "${c_dim}==>${c_off} $title"
 		echo
-		run_sub "$@"
+		echo "== $title"
+		run_sub "$@" < /dev/null
+		if [ "$sub_rc" -eq 0 ]; then
+			echo "== End of $title."
+		else
+			echo "== End of $title, with errors."
+		fi
 		echo
-		if [ "$sub_rc" -eq 0 ]; then echo "${c_ok}done${c_off}"; else echo "${c_err}finished with errors (exit $sub_rc)${c_off}"; fi
-		read -r -p "Press Enter to return to the menu " _ || true
 	}
 
-#one line per item for the menu header
-	ui_summary() {
-		local fpm cli
+	ui_status_line() {
+		local fpm
 		fpm=$(running_fpm_versions | tr '\n' ' ')
-		cli=$(default_cli_version)
-		printf 'php-fpm running: %s\n/usr/bin/php: php %s\n\nChoose an action:' "${fpm:-none}" "$cli"
+		fpm=${fpm% }
+		echo "Running php-fpm: ${fpm:-none}. The php command: php $(default_cli_version)."
 	}
 
 	ui_plan() {
@@ -1595,42 +1624,55 @@ EOF
 		cmd_switch "$1"
 	}
 
-#pick a version, options, check urls; show the plan; apply after confirmation
+#pick a version and options, show the plan, apply after confirmation
 	ui_switch() {
-		local items=() version candidate desc on target active installed running count v opts urls dirs plan u d
+		local args=() version candidate label active installed running count v plan target='' rc
 		allow_prerelease=false
 		allow_missing_ext=false
 		from_arg=''
 		if [ -z "$(php_sources)" ]; then
-			if wt --title "Repository" --yesno "No $(repo_label) repository is configured, so only the distro's own PHP can be installed.
-
-Add $(repo_label) now?" 12 70; then
-				ui_run "Adding $(repo_label)" repo_add
-			fi
+			echo "No $(repo_label) repository is configured, so only the distro's own PHP can be installed."
+			rc=0
+			ask_yes_no "Add $(repo_label) now?" yes || rc=$?
+			if [ "$rc" -eq 2 ]; then return 0; fi
+			if [ "$rc" -eq 0 ]; then ui_do "Adding $(repo_label)" repo_add; fi
 		fi
 		active=$(running_fpm_versions | tail -1)
 		[ -n "$active" ] || active=$(default_cli_version)
 		installed=" $(installed_versions | tr '\n' ' ') "
 		while IFS=$'\t' read -r version candidate; do
-			desc=$candidate
-			if is_prerelease "$candidate"; then desc="$desc  [prerelease]"; fi
-			case "$installed" in *" $version "*) desc="$desc  (installed)" ;; esac
-			on=OFF
-			if [ "$version" = "$active" ]; then desc="$desc  (active)"; on=ON; fi
-			items+=("$version" "$desc" "$on")
+			label=${candidate#*:}
+			label="$version (${label%%[-+]*})"
+			if is_prerelease "$candidate"; then label="$label, prerelease"; fi
+			case "$installed" in *" $version "*) label="$label, installed" ;; esac
+			if [ "$version" = "$active" ]; then label="$label, active now"; fi
+			args+=("$version" "$label")
 		done < <(available_versions)
-		if [ "${#items[@]}" -eq 0 ]; then
-			wt --title "Switch PHP version" --msgbox "apt offers no PHP versions. Check the repository from the main menu." 8 70 || true
+		if [ "${#args[@]}" -eq 0 ]; then
+			echo "apt offers no PHP versions. Check the repository from the main menu."
 			return 0
 		fi
-		target=$(wt --title "Switch PHP version" --radiolist "Active now: php $active
-Space selects a version, Enter continues." "$ui_h" "$ui_w" $(( ui_h - 9 )) "${items[@]}") || return 0
-		[ -n "$target" ] || return 0
+		echo
+		echo "Switch PHP version. Active now: php $active. Versions apt can install:"
+		ui_list "${args[@]}"
+		while [ -z "$target" ]; do
+			ask "Version to switch to: its number, the version itself such as 8.4, or 0 to go back" || return 0
+			case "$reply" in
+				0|'') return 0 ;;
+			esac
+			ui_pick "$reply"
+			if [ -z "$choice" ]; then
+				for v in "${ui_keys[@]}"; do
+					if [ "$v" = "$reply" ]; then choice=$v; fi
+				done
+			fi
+			if [ -z "$choice" ]; then echo "$reply is not in the list."; else target=$choice; fi
+		done
 		candidate=$(available_versions | awk -F'\t' -v v="$target" '$1 == v {print $2}')
 		if is_prerelease "$candidate"; then
-			wt --title "Prerelease" --yesno "php $target is a prerelease ($candidate).
-
-Switch to it anyway?" 12 70 || return 0
+			rc=0
+			ask_yes_no "php $target is a prerelease. Switch to it anyway?" no || rc=$?
+			if [ "$rc" -ne 0 ]; then return 0; fi
 			allow_prerelease=true
 		fi
 
@@ -1638,115 +1680,139 @@ Switch to it anyway?" 12 70 || return 0
 			running=$(running_fpm_versions)
 			count=$(grep -c . <<< "$running" || true)
 			if [ "$count" -gt 1 ]; then
-				items=()
-				for v in $running; do items+=("$v" "php$v-fpm is running" OFF); done
-				from_arg=$(wt --title "Switch away from" --radiolist "Several php-fpm versions are running. Which one does php $target replace?" 14 70 "$count" "${items[@]}") || return 0
-				[ -n "$from_arg" ] || return 0
+				args=()
+				for v in $running; do args+=("$v" "php $v"); done
+				echo "Several php-fpm versions are running. Which one does php $target replace?"
+				ui_list "${args[@]}"
+				ask "Number, or 0 to go back" || return 0
+				ui_pick "$reply"
+				[ -n "$choice" ] || return 0
+				from_arg=$choice
 			fi
 
-		#options
-			opts=$(wt --title "Options" --separate-output --checklist "Space toggles, Enter continues." 14 "$ui_w" 3 \
-				restart "Restart services and supervisor programs that run PHP" "$( [ "$ui_restart" = on ] && echo ON || echo OFF )" \
-				lint "PHP-lint a code directory first; new parse errors stop the switch" "$( [ -n "$ui_lint_dirs" ] && echo ON || echo OFF )" \
-				missing "Continue even if PHP extensions would go missing" OFF) || return 0
-			urls=$(wt --title "Check URLs" --inputbox "URLs that must keep answering after the switch, separated by spaces.
-Leave empty to rely on the php-fpm pool checks alone." 11 "$ui_w" "$ui_check_urls") || return 0
-			dirs=''
-			if grep -x lint <<< "$opts" >/dev/null; then
-				dirs=$(wt --title "Lint" --inputbox "Directories to lint with php $target, separated by spaces." 10 "$ui_w" "$ui_lint_dirs") || return 0
-			fi
-			ui_check_urls=$(tr -d '"' <<< "$urls")
-			ui_lint_dirs=$(tr -d '"' <<< "$dirs")
-			if grep -x restart <<< "$opts" >/dev/null; then ui_restart=on; else ui_restart=off; fi
+		#options; the answers become the defaults next time
+			rc=0
+			ask_yes_no "Restart the services and supervisor programs that run PHP?" "$( [ "$ui_restart" = on ] && echo yes || echo no )" || rc=$?
+			if [ "$rc" -eq 2 ]; then return 0; fi
+			if [ "$rc" -eq 0 ]; then ui_restart=on; else ui_restart=off; fi
+			ask_list "URLs that must keep answering after the switch." "$ui_check_urls" || return 0
+			ui_check_urls=$reply
+			ask_list "Directories to check with php -l before switching; a new parse error stops the switch." "$ui_lint_dirs" || return 0
+			ui_lint_dirs=$reply
+			rc=0
+			ask_yes_no "Continue even if PHP extensions would go missing?" no || rc=$?
+			if [ "$rc" -eq 2 ]; then return 0; fi
+			if [ "$rc" -eq 0 ]; then allow_missing_ext=true; fi
 			ui_save
 			if [ "$ui_restart" = on ]; then restart_dependents=true; else restart_dependents=false; fi
-			if grep -x missing <<< "$opts" >/dev/null; then allow_missing_ext=true; fi
-			check_urls=()
-			for u in $ui_check_urls; do check_urls+=("$u"); done
-			lint_dirs=()
-			for d in $ui_lint_dirs; do lint_dirs+=("$d"); done
+			read -r -a check_urls <<< "$ui_check_urls"
+			read -r -a lint_dirs <<< "$ui_lint_dirs"
 
 		#plan, then confirm and apply
 			plan=$(mktemp)
-			run_sub plain ui_plan "$target" > "$plan" 2>&1
+			echo
+			echo "== Plan"
+			run_sub ui_plan "$target" > "$plan" 2>&1 < /dev/null
+			cat "$plan"
+			echo "== End of plan."
 			if grep 'is already active' "$plan" >/dev/null; then
-				ui_textbox "Already active" "$plan"
-			elif [ "$sub_rc" -ne 0 ] || ! grep '^switch ' "$plan" >/dev/null; then
-				ui_textbox "Cannot switch to php $target" "$plan"
-			else
-				ui_textbox "Plan" "$plan"
-				if wt --title "Apply" --defaultno --yesno "Apply this switch to php $target now?
-
-If a health check fails, everything is rolled back." 11 70; then
-					ui_run "Switching to php $target" ui_apply "$target"
-				fi
+				rm -f "$plan"
+				return 0
+			fi
+			if [ "$sub_rc" -ne 0 ] || ! grep '^switch ' "$plan" >/dev/null; then
+				echo "php-switch cannot switch to php $target; the reason is above."
+				rm -f "$plan"
+				return 0
 			fi
 			rm -f "$plan"
+			rc=0
+			ask_yes_no "Apply this switch to php $target now? If a health check fails, everything is rolled back." no || rc=$?
+			if [ "$rc" -eq 0 ]; then
+				ui_do "Switching to php $target" ui_apply "$target"
+			else
+				echo "Nothing was changed."
+			fi
 	}
 
 	ui_check() {
-		local urls u
-		urls=$(wt --title "Health check" --inputbox "URLs to check besides the php-fpm pools, separated by spaces. Leave empty for none." 10 "$ui_w" "$ui_check_urls") || return 0
-		check_urls=()
-		for u in $urls; do check_urls+=("$u"); done
-		ui_show "Health check" cmd_check
+		ask_list "URLs to check as well as the php-fpm pools." "$ui_check_urls" || return 0
+		read -r -a check_urls <<< "$reply"
+		ui_do "Health check" cmd_check
 	}
 
 	ui_repo() {
-		local items=() choice
-		if [ -z "$(php_sources)" ]; then items+=(add "Add $(repo_label)"); fi
-		items+=(check "Check the repository and its signing key (no changes)")
-		items+=(fix "Check, and repair a missing, expired or broken key")
-		choice=$(wt --title "Repository: $(repo_label)" --menu "" 13 "$ui_w" 3 "${items[@]}") || return 0
+		local args=()
+		if [ -z "$(php_sources)" ]; then args+=(add "Add $(repo_label)"); fi
+		args+=(check "Check the repository and its signing key, without changing anything")
+		args+=(fix "Check, and repair a missing, expired or broken key")
+		echo
+		echo "Repository: $(repo_label)."
+		ui_list "${args[@]}"
+		ask "Number, or 0 to go back" || return 0
+		ui_pick "$reply"
 		case "$choice" in
-			add) ui_run "Adding $(repo_label)" repo_add ;;
-			check) ui_show "Repository check" repo_check check ;;
-			fix) ui_run "Repository check and repair" repo_check fix ;;
+			add) ui_do "Adding $(repo_label)" repo_add ;;
+			check) ui_do "Repository check" repo_check check ;;
+			fix) ui_do "Repository check and repair" repo_check fix ;;
 		esac
 	}
 
 	ui_settings() {
-		local urls dirs
-		urls=$(wt --title "Settings" --inputbox "Default check URLs for switches and health checks, separated by spaces." 10 "$ui_w" "$ui_check_urls") || return 0
-		dirs=$(wt --title "Settings" --inputbox "Default directories to lint before a switch, separated by spaces. Empty turns linting off." 10 "$ui_w" "$ui_lint_dirs") || return 0
-		ui_check_urls=$(tr -d '"' <<< "$urls")
-		ui_lint_dirs=$(tr -d '"' <<< "$dirs")
-		if wt --title "Settings" --yesno "Restart services and supervisor programs that run PHP after a switch?" 9 70; then ui_restart=on; else ui_restart=off; fi
+		local rc=0
+		echo
+		echo "Settings, saved in $ui_conf."
+		ask_list "Default URLs to check after a switch and in health checks." "$ui_check_urls" || return 0
+		ui_check_urls=$reply
+		ask_list "Default directories to check with php -l before a switch." "$ui_lint_dirs" || return 0
+		ui_lint_dirs=$reply
+		ask_yes_no "Restart the services and supervisor programs that run PHP after a switch?" "$( [ "$ui_restart" = on ] && echo yes || echo no )" || rc=$?
+		if [ "$rc" -eq 2 ]; then return 0; fi
+		if [ "$rc" -eq 0 ]; then ui_restart=on; else ui_restart=off; fi
 		ui_save
-		wt --title "Settings" --msgbox "Saved to $ui_conf" 8 60 || true
+		echo "Settings saved."
 	}
 
 	cmd_menu() {
-		local choice
+		local show=true
 		[ "$(id -u)" = 0 ] || die "the menu needs root: sudo php-switch"
-		if ! has "$whiptail"; then
-			echo "installing whiptail for the menu"
-			pkg_install whiptail
-		fi
 		ui_load
+		step_marker=''
+		echo "php-switch $php_switch_version on $os_name, using $(repo_label)."
 		while true; do
-			ui_size
-			choice=$(wt --title "php-switch" --notags --menu "$(ui_summary)" "$ui_h" "$ui_w" 8 \
-				switch "Switch PHP version" \
-				status "Status: installed versions and what is active" \
-				services "Services and programs running PHP" \
-				check "Health check" \
-				repo "Repository and signing key" \
-				versions "Versions available to install" \
-				settings "Settings" \
-				quit "Quit") || break
+			if $show; then
+				ui_status_line
+				echo "Main menu:"
+				ui_list \
+					switch "Switch PHP version" \
+					status "Status: installed versions and what is active" \
+					services "Services and programs that run PHP" \
+					check "Health check" \
+					repo "Repository and signing key" \
+					versions "Versions available to install" \
+					settings "Settings" \
+					quit "Quit"
+				show=false
+			fi
+			ask "Main menu. Choose 1 to ${#ui_keys[@]}, or press Enter to hear the choices again" || break
+			if [ -z "$reply" ]; then show=true; continue; fi
+			case "${reply,,}" in
+				0|q|quit|exit) break ;;
+			esac
+			ui_pick "$reply"
 			case "$choice" in
 				switch) ui_switch ;;
-				status) ui_show "Status" cmd_status ;;
-				services) ui_show "Services running PHP" cmd_services ;;
+				status) ui_do "Status" cmd_status ;;
+				services) ui_do "Services and programs that run PHP" cmd_services ;;
 				check) ui_check ;;
 				repo) ui_repo ;;
-				versions) ui_show "Versions available to install" cmd_list ;;
+				versions) ui_do "Versions available to install" cmd_list ;;
 				settings) ui_settings ;;
-				*) break ;;
+				quit) break ;;
+				*) echo "$reply is not a choice."; show=true ;;
 			esac
+			ui_keys=(switch status services check repo versions settings quit)
 		done
-		clear 2>/dev/null || true
+		echo "Goodbye."
 	}
 
 #--- main ---------------------------------------------------------------------------------------

@@ -14,7 +14,7 @@ uninstall:
 
 check:
 	bash -n php-switch
-	shellcheck php-switch tests/run.sh tests/fake-whiptail
+	shellcheck php-switch tests/run.sh
 
 test:
 	tests/run.sh

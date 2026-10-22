@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.0 — 2026-10-21
+
+- The menu is now line-based: numbered choices, plain prompts, and results between headings, with
+  nothing drawn or redrawn on screen. It works with screen readers and braille displays, and no
+  longer needs whiptail. You can type a version (`8.4`) instead of its number. `NO_COLOR` is honoured.
+- Fixed: switching to PHP 8.4 or newer stopped with "php reports startup problems" when ionCube was
+  loaded. PHP 8.4 reserves a JIT buffer by default, and JIT cannot run alongside ionCube, so PHP
+  warned at every start. The switch now sets `opcache.jit = disable` for the new version in that
+  case.
+- Actions run from the menu no longer read from the keyboard, so typing ahead cannot answer a
+  question meant for later.
+
 ## 1.0.0 — 2026-10-21
 
 First public release.

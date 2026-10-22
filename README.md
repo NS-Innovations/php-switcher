@@ -7,7 +7,11 @@ the `php` command and every service that runs PHP — with health checks and aut
 sudo php-switch
 ```
 
-opens a menu. Pick a version, look at the plan, confirm. That's it.
+opens a menu. Pick a version, read the plan, confirm. That's it.
+
+The menu is plain text, line by line: numbered choices, simple prompts, and results printed in order
+between clear headings. Nothing is drawn or redrawn on the screen, so it works well with screen
+readers (Orca, speakup, NVDA or JAWS over SSH) and braille displays, and over any SSH connection.
 
 ## What it does
 
@@ -39,7 +43,6 @@ Old versions stay installed (stopped and disabled), so switching back takes seco
   as Debian or Ubuntu in `/etc/os-release` (Mint, Pop!\_OS, Raspberry Pi OS, …) are accepted but
   have not been tested.
 - bash 4 or newer, root
-- `whiptail` for the menu (installed by default on Debian and Ubuntu; installed on first use if not)
 
 ## Install
 
@@ -58,28 +61,49 @@ It is a single bash script, so copying `php-switch` anywhere on root's `PATH` wo
 sudo php-switch
 ```
 
-| Menu item | What it does |
+```
+php-switch 1.1.0 on Debian GNU/Linux 12 (bookworm), using packages.sury.org.
+Running php-fpm: 8.2. The php command: php 8.2.
+Main menu:
+  1. Switch PHP version
+  2. Status: installed versions and what is active
+  3. Services and programs that run PHP
+  4. Health check
+  5. Repository and signing key
+  6. Versions available to install
+  7. Settings
+  8. Quit
+Main menu. Choose 1 to 8, or press Enter to hear the choices again:
+```
+
+Type a number and press Enter. In lists, 0 goes back. Results start with a `== Title` line and end
+with `== End of Title.`, so you always know where one finishes.
+
+| Choice | What it does |
 |---|---|
-| Switch PHP version | choose a version, choose options, read the plan, confirm |
+| Switch PHP version | choose a version, answer a few questions, read the plan, confirm |
 | Status | installed versions, which PHP-FPM is running, its pools, the `php` command |
-| Services and programs running PHP | what a switch would restart, and what it would leave alone and why |
+| Services and programs that run PHP | what a switch would restart, and what it would leave alone and why |
 | Health check | probe every PHP-FPM pool, plus any URLs you give |
 | Repository and signing key | check only, or check and repair; add the repository if it is missing |
 | Versions available to install | everything apt can install, prereleases marked |
 | Settings | default check URLs, lint directories, and whether to restart services |
 
-Before switching, the menu asks for:
+When switching you can type the version itself (`8.4`) instead of its number. Then it asks:
 
-- **Restart services and supervisor programs that run PHP** (on by default)
-- **PHP-lint a code directory first** — every `.php` file is checked with the new version; a file
-  that parses today but not on the new version stops the switch before anything changes
-- **Continue even if PHP extensions would go missing** (off by default)
-- **Check URLs** — pages that must keep answering after the switch, for example your login page
+- **Restart the services and supervisor programs that run PHP?** (yes by default)
+- **URLs that must keep answering after the switch** — for example your login page
+- **Directories to check with php -l before switching** — every `.php` file is checked with the new
+  version; a file that parses today but not on the new version stops the switch before anything
+  changes
+- **Continue even if PHP extensions would go missing?** (no by default)
 
-The plan shows exactly what will happen: packages, pools and sockets, web server files, the `php`
-command, and each service that will be restarted or left alone. Nothing changes until you confirm.
+Each question shows its default in brackets; press Enter to keep it, or type `none` to clear a list.
+Your answers become the defaults next time. Then the plan is printed — packages, pools and
+sockets, web server files, the `php` command, and each service that will be restarted or left
+alone — and nothing changes until you answer yes.
 
-Settings are kept in `/etc/php-switch.conf`.
+Settings are kept in `/etc/php-switch.conf`. Set `NO_COLOR=1` to turn colors off.
 
 ## Command line
 
@@ -126,6 +150,9 @@ Steps 1–4 change nothing that serves traffic. A failure from step 5 on rolls e
 - **Apache with mod_php** is switched with `a2dismod` / `a2enmod` and a graceful restart.
 - **Settings the new version rejects** (removed or deprecated `php.ini` directives) are commented
   out in the new `php.ini`, with a note, instead of being carried over.
+- **JIT and ionCube**: ionCube installs its own opcode handlers, which JIT cannot work with. PHP
+  8.4 and newer then warn at every start that JIT was disabled. When that happens, the switch sets
+  `opcache.jit = disable` in `conf.d/99-php-switch-jit.ini`, which is what PHP was doing anyway.
 - **Extensions compiled into PHP itself** come and go with the version (for example `random` in 8.2,
   `opcache`, `lexbor` and `uri` in 8.5) and are not reported as missing.
 - **ionCube loaders** are downloaded from ioncube.com when the server already uses ionCube. Set
@@ -151,8 +178,8 @@ sudo tests/run.sh            # syntax, shellcheck, and every menu flow that chan
 sudo tests/run.sh --switch   # also switches through the menu and back: disposable machines only
 ```
 
-The menu tests run `php-switch` against `tests/fake-whiptail`, which answers each dialog from a
-script and records what was shown.
+The menu tests type their answers on standard input, and check that the menu never prints terminal
+control sequences that would confuse a screen reader.
 
 ## Contributing
 

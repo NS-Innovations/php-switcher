@@ -16,5 +16,5 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck whiptail php-cli php-fpm
+      - run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck php-cli php-fpm
       - run: sudo tests/run.sh

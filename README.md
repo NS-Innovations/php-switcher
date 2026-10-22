@@ -44,7 +44,7 @@ Old versions stay installed (stopped and disabled), so switching back takes seco
 ## Install
 
 ```
-git clone <repository url> php-switcher
+git clone https://github.com/NS-Innovations/php-switcher.git
 cd php-switcher
 sudo make install            # installs /usr/local/sbin/php-switch
 ```

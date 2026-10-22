@@ -1,0 +1,1802 @@
+#!/usr/bin/env bash
+#
+# php-switch - install PHP versions side by side and live-switch a Debian or Ubuntu server between them
+#
+# Run it with no arguments for the menu. Every function is there: switching versions, status, the
+# services that run PHP, health checks, and checking or repairing the PHP repository and its key.
+#
+# Uses packages.sury.org on Debian and ppa:ondrej/php on Ubuntu (and their derivatives), adding the
+# repository when needed and repairing a missing, expired or broken signing key. Needs bash 4,
+# systemd and root.
+#
+# The same functions are available as commands, for scripts and automation:
+#   menu                         the interactive menu (the default on a terminal)
+#   status                       installed versions, what serves the web and what /usr/bin/php is
+#   list                         versions apt can install
+#   repo [--check]               check the php repository and its signing key; repairs unless --check
+#   services                     systemd units and supervisor programs running php, and what a switch does to them
+#   check [--check-url URL]      probe every pool of the running php-fpm over FastCGI
+#   switch <x.y|latest> [opts]   install if needed, then live switch
+#   version                      print the php-switch version
+#
+# Switch options
+#   -y, --yes             do not ask for confirmation
+#   -n, --dry-run         print the plan and stop
+#   --from x.y            the version to switch away from, when more than one php-fpm is running
+#   --lint DIR            php -l every .php file under DIR (repeatable); fails only on new parse errors
+#   --check-url URL       must still answer below 500 (and below 400 if it did before); repeatable
+#   --allow-prerelease    let a version resolve to an alpha / beta / RC build
+#   --allow-missing-ext   continue when the target lacks extensions the current version loads
+#   --no-restart          leave systemd units and supervisor programs alone
+#
+# A switch, in order. Steps 1-4 change nothing that serves traffic; a failure from step 5 on rolls
+# everything back.
+#   1. check the php repository and its signing key, repairing a missing, expired or broken key
+#   2. install the target version with the same set of extension packages
+#   3. carry over php.ini, php-fpm.conf, pool and conf.d changes, systemd drop-ins and ionCube
+#   4. validate: php-fpm -t, startup warnings, extension parity, optional lint
+#   5. start the target php-fpm beside the current one and probe every pool over FastCGI; a pool
+#      whose address has no version in it is handed over instead: the old php-fpm stops just
+#      before the new one starts
+#   6. point nginx / apache / caddy / lighttpd at the new sockets, test and reload them
+#   7. switch the default php cli (/usr/bin/php and the other php alternatives)
+#   8. restart the systemd units and supervisor programs running the old php via the default cli
+#   9. stop the old php-fpm, run the health checks
+# Old versions stay installed (stopped and disabled), so switching back is quick.
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Norman King
+# https://opensource.org/license/mit
+
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+	echo "php-switch needs bash 4 or newer" >&2
+	exit 1
+fi
+set -o errexit -o errtrace -o nounset -o pipefail
+
+#set defaults
+	php_switch_version=1.0.0
+	backup_root=/var/backups/php-switch
+	ui_conf=${PHP_SWITCH_CONF:-/etc/php-switch.conf}
+	whiptail=${PHP_SWITCH_WHIPTAIL:-whiptail}
+	assume_yes=false
+	dry_run=false
+	check_only=false
+	allow_prerelease=false
+	allow_missing_ext=false
+	restart_dependents=true
+	from_arg=''
+	lint_dirs=()
+	check_urls=()
+	alternatives="php phar phar.phar phpize php-config phpdbg php-cgi"
+	declare -A sup_pid=()
+	probe_dir=''
+
+#colors when attached to a terminal
+	set_colors() {
+		if [ "$1" = on ]; then
+			c_ok=$'\e[32m'; c_warn=$'\e[33m'; c_err=$'\e[31m'; c_dim=$'\e[2m'; c_off=$'\e[0m'
+		else
+			c_ok=''; c_warn=''; c_err=''; c_dim=''; c_off=''
+		fi
+	}
+	if [ -t 1 ]; then set_colors on; else set_colors off; fi
+
+#output helpers
+	step() { echo "${c_dim}==>${c_off} $*"; }
+	ok() { echo "  ${c_ok}ok${c_off}   $*"; }
+	info() { echo "  ${c_dim}--${c_off}   $*"; }
+	warn() { echo "  ${c_warn}warn${c_off} $*" >&2; }
+	fail() { echo "  ${c_err}FAIL${c_off} $*" >&2; }
+	die() { echo "${c_err}error:${c_off} $*" >&2; exit 1; }
+	has() { command -v "$1" >/dev/null 2>&1; }
+
+#download a url to a file
+	fetch() {
+		if has curl; then
+			curl -fsSL --retry 2 --max-time 60 -o "$2" "$1"
+		elif has wget; then
+			wget -q -T 60 -O "$2" "$1"
+		else
+			die "need curl or wget to download $1"
+		fi
+	}
+
+#remove temporary files on exit
+	cleanup() {
+		if [ -n "$probe_dir" ] && [ -d "$probe_dir" ]; then
+			rm -rf "$probe_dir"
+		fi
+	}
+	trap cleanup EXIT
+
+#make sure this is a debian or ubuntu family system with systemd
+	detect_platform() {
+		local ID='' ID_LIKE='' VERSION_ID='' VERSION_CODENAME='' UBUNTU_CODENAME='' PRETTY_NAME=''
+		if [ -r /etc/os-release ]; then
+			# shellcheck source=/dev/null
+			. /etc/os-release
+		fi
+		os_like=" ${ID:-} ${ID_LIKE:-} "
+		os_codename=${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}
+		os_name=${PRETTY_NAME:-${ID:-unknown} ${VERSION_ID:-}}
+		case "$os_like" in
+			*" ubuntu "*) repo_kind=ondrej ;;
+			*" debian "*) repo_kind=sury ;;
+			*) die "php-switch supports Debian, Ubuntu and their derivatives; this is $os_name" ;;
+		esac
+		if ! has apt-get || ! has dpkg-query; then die "apt-get and dpkg-query are required"; fi
+		[ -d /run/systemd/system ] || die "php-switch needs systemd"
+	}
+
+#--- version naming and paths -------------------------------------------------------------------
+
+	cli_bin() { echo "/usr/bin/php$1"; }
+	cgi_bin() { echo "/usr/bin/php-cgi$1"; }
+	fpm_bin() { echo "/usr/sbin/php-fpm$1"; }
+	fpm_service() { echo "php$1-fpm"; }
+	ini_file() { echo "/etc/php/$1/$2/php.ini"; }
+	confd() { echo "/etc/php/$1/$2/conf.d"; }
+	pool_dir() { echo "/etc/php/$1/fpm/pool.d"; }
+	fpm_conf() { echo "/etc/php/$1/fpm/php-fpm.conf"; }
+
+#the packaged, unmodified php.ini for a version
+	ini_template() {
+		if [ "$2" = cli ] && [ -f "/usr/lib/php/$1/php.ini-production.cli" ]; then
+			echo "/usr/lib/php/$1/php.ini-production.cli"
+		elif [ -f "/usr/lib/php/$1/php.ini-production" ]; then
+			echo "/usr/lib/php/$1/php.ini-production"
+		fi
+		return 0
+	}
+
+#rewrite version-specific tokens (php8.2, /php/8.2/, fpm8.2) from one version to another
+	subst_version() {
+		sed -e "s#php$1#php$2#g" -e "s#/php/$1/#/php/$2/#g" -e "s#fpm$1#fpm$2#g"
+	}
+
+#--- packages -----------------------------------------------------------------------------------
+
+#versions with a cli installed
+	installed_versions() {
+		local f n
+		for f in /usr/bin/php[0-9]*; do
+			n=${f#/usr/bin/php}
+			if [[ "$n" =~ ^[0-9]+\.[0-9]+$ ]]; then echo "$n"; fi
+		done | sort -V
+	}
+
+#"version<TAB>candidate" for every version apt offers
+	available_versions() {
+		local names
+		names=$(apt-cache pkgnames php 2>/dev/null | grep -E '^php[0-9]+\.[0-9]+-cli$' | sort -V || true)
+		[ -n "$names" ] || return 0
+		# shellcheck disable=SC2086
+		apt-cache policy $names 2>/dev/null | awk '
+			/^[^ ].*:$/ { name = $1; sub(/:$/, "", name); sub(/^php/, "", name); sub(/-cli$/, "", name) }
+			/Candidate:/ { if ($2 != "(none)") print name "\t" $2 }'
+	}
+
+	is_prerelease() { [[ "$1" =~ (~|[.-])(alpha|beta|rc|RC)[0-9]* ]]; }
+
+#package suffixes installed for a version; @main is phpX.Y itself, @apache is libapache2-mod-phpX.Y
+	installed_suffixes() {
+		dpkg-query -W -f='${Package} ${Status}\n' "php$1" "php$1-*" "libapache2-mod-php$1" 2>/dev/null \
+			| awk '/ install ok installed$/ {print $1}' \
+			| sed -e "s/^libapache2-mod-php$1\$/@apache/" -e "s/^php$1\$/@main/" -e "s/^php$1-//" \
+			| grep -vE '(dbgsym|dbg)$' | sort -u || true
+	}
+
+	pkg_name() {
+		case "$2" in
+			@main) echo "php$1" ;;
+			@apache) echo "libapache2-mod-php$1" ;;
+			*) echo "php$1-$2" ;;
+		esac
+	}
+
+#every installable package name for a version
+	available_names() {
+		apt-cache pkgnames "php$1" 2>/dev/null || true
+		apt-cache pkgnames "libapache2-mod-php$1" 2>/dev/null || true
+	}
+
+	pkg_install() {
+		local log rc=0
+		log=$(mktemp)
+		DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$@" >"$log" 2>&1 || rc=$?
+		if [ $rc -ne 0 ]; then tail -20 "$log" >&2; fi
+		rm -f "$log"
+		return $rc
+	}
+
+#--- repository and signing keys ----------------------------------------------------------------
+
+#apt source files that point at sury or the ondrej ppa
+	php_sources() {
+		local f
+		for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+			[ -f "$f" ] || continue
+			if grep -E '^[^#]*(packages\.sury\.org|ppa\.launchpad(content)?\.net/ondrej/)' "$f" >/dev/null 2>&1; then
+				echo "$f"
+			fi
+		done
+	}
+
+	repo_label() {
+		if [ "$repo_kind" = sury ]; then echo packages.sury.org; else echo ppa:ondrej/php; fi
+	}
+
+#the Signed-By keyring of a source file: a path, "inline", or empty for the legacy global keyrings
+	source_keyring() {
+		local value
+		case "$1" in
+			*.sources)
+				value=$(awk -F': *' 'tolower($1) == "signed-by" {print $2; exit}' "$1")
+				if [ -z "$value" ] && grep -i '^signed-by:' "$1" >/dev/null; then value=inline; fi
+				case "$value" in
+					/*|'') echo "$value" ;;
+					*) echo inline ;;
+				esac
+				;;
+			*)
+				grep -E '^[^#]*(sury|ondrej)' "$1" | grep -oE 'signed-by=[^] ]+' | head -1 | cut -d= -f2 || true
+				;;
+		esac
+	}
+
+	source_kind() {
+		if grep -E '^[^#]*ondrej/' "$1" >/dev/null 2>&1; then echo ondrej; else echo sury; fi
+	}
+
+#what is wrong with a keyring file, or "#expires <epoch|never>" when it is usable
+	key_problem() {
+		local key=$1 colons
+		if [ ! -s "$key" ]; then echo "missing or empty"; return 0; fi
+		if head -c 64 "$key" | grep -- '-----BEGIN' >/dev/null && [ "${key##*.}" != asc ]; then
+			echo "ascii-armored but named .${key##*.}; apt reads only binary keys unless the file ends in .asc"
+			return 0
+		fi
+		colons=$(gpg --batch --show-keys --with-colons "$key" 2>/dev/null) || { echo "not a readable OpenPGP key"; return 0; }
+		awk -F: -v now="$(date +%s)" '
+			($1 == "pub" || $1 == "sub") && index($12, "s") {
+				signing = 1
+				if ($2 == "r") { revoked = 1; next }
+				if ($7 != "" && $7 + 0 < now + 0) { if ($7 > expired) expired = $7; next }
+				usable = 1
+				if ($7 == "") forever = 1; else if ($7 > best) best = $7
+			}
+			END {
+				if (!signing) print "problem\tno signing key in the file"
+				else if (usable) print "expires\t" (forever ? "never" : best)
+				else if (revoked) print "problem\trevoked"
+				else print "problem\texpired\t" expired
+			}' <<< "$colons" | {
+			local kind detail extra
+			IFS=$'\t' read -r kind detail extra
+			if [ "$kind" = expires ]; then
+				echo "#expires $detail"
+			elif [ "$detail" = expired ]; then
+				echo "expired on $(date -d "@$extra" +%Y-%m-%d 2>/dev/null || echo "$extra")"
+			else
+				echo "$detail"
+			fi
+		}
+	}
+
+#run apt-get update for one source file only and print apt's output
+	source_update() {
+		local tmp out
+		tmp=$(mktemp -d)
+		cp "$1" "$tmp/"
+		out=$(apt-get update -o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts="$tmp" \
+			-o APT::Get::List-Cleanup=false 2>&1 || true)
+		rm -rf "$tmp"
+		echo "$out"
+	}
+
+	signature_error() {
+		grep -E 'NO_PUBKEY|EXPKEYSIG|KEYEXPIRED|REVKEYSIG|BADSIG|is not signed|signatures were invalid|could not be verified|OpenPGP signature verification failed|Missing key|Signed-By' <<< "$1" | head -3 || true
+	}
+	fetch_error() {
+		grep -E '^(E|Err):|Failed to fetch|Could not resolve|404' <<< "$1" | head -3 || true
+	}
+
+#download the repository signing key into a keyring file (binary, or armored when it ends in .asc)
+	fetch_repo_key() {
+		local kind=$1 dest=$2 tmp fp
+		has gpg || pkg_install gnupg
+		tmp=$(mktemp -d)
+		if [ "$kind" = sury ]; then
+			fetch https://packages.sury.org/php/apt.gpg "$tmp/key"
+		else
+			fetch https://api.launchpad.net/1.0/~ondrej/+archive/ubuntu/php "$tmp/ppa.json"
+			fp=$(grep -oE '"signing_key_fingerprint": *"[0-9A-F]+"' "$tmp/ppa.json" | grep -oE '[0-9A-F]{40}' || true)
+			[ -n "$fp" ] || { rm -rf "$tmp"; die "could not read the ondrej/php signing key fingerprint from Launchpad"; }
+			fetch "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x$fp" "$tmp/key"
+		fi
+		mkdir -p "$tmp/gnupg"
+		chmod 700 "$tmp/gnupg"
+		GNUPGHOME="$tmp/gnupg" gpg --batch --quiet --import "$tmp/key" 2>/dev/null || { rm -rf "$tmp"; die "the downloaded $kind key is not a valid OpenPGP key"; }
+		if [ "${dest##*.}" = asc ]; then
+			GNUPGHOME="$tmp/gnupg" gpg --batch --armor --export > "$tmp/out"
+		else
+			GNUPGHOME="$tmp/gnupg" gpg --batch --export > "$tmp/out"
+		fi
+		if [ -n "$(key_problem "$tmp/out" | grep -v '^#' || true)" ]; then
+			rm -rf "$tmp"
+			die "the freshly downloaded $kind key is itself unusable"
+		fi
+		mkdir -p "$(dirname "$dest")"
+		install -m 644 "$tmp/out" "$dest"
+		rm -rf "$tmp"
+	}
+
+#replace an inline Signed-By block in a deb822 file with a path
+	deb822_set_signed_by() {
+		awk -v path="$2" '
+			skip && /^[ \t]/ { next }
+			{ skip = 0 }
+			tolower($0) ~ /^signed-by:/ { print "Signed-By: " path; skip = 1; next }
+			{ print }' "$1" > "$1.tmp" && cat "$1.tmp" > "$1" && rm -f "$1.tmp"
+	}
+
+#check (and with "fix", repair) every php source; returns non-zero when one is still broken
+	repo_check() {
+		local mode=$1 sources file kind keyring problem out sig fetch_err expires days broken=0
+		sources=$(php_sources)
+		if [ -z "$sources" ]; then
+			info "no sury / ondrej php repository configured (only the distro's own php is available)"
+			return 0
+		fi
+		has gpg || { if [ "$mode" = fix ]; then pkg_install gnupg; else warn "gpg is not installed; key contents not inspected"; fi; }
+		for file in $sources; do
+			kind=$(source_kind "$file")
+			keyring=$(source_keyring "$file")
+			problem=''
+			if [ "$keyring" = inline ]; then
+				info "$file: key is inline in the file"
+			elif [ -n "$keyring" ]; then
+				if has gpg; then
+					problem=$(key_problem "$keyring")
+					if [[ "$problem" == "#expires "* ]]; then
+						expires=${problem#\#expires }
+						if [ "$expires" = never ]; then
+							info "$kind key $keyring: no expiry"
+						else
+							days=$(( (expires - $(date +%s)) / 86400 ))
+							if [ "$days" -lt 30 ]; then
+								warn "$kind key $keyring expires in $days days; the next run after that repairs it"
+							else
+								info "$kind key $keyring: valid until $(date -d "@$expires" +%Y-%m-%d)"
+							fi
+						fi
+						problem=''
+					fi
+				elif [ ! -s "$keyring" ]; then
+					problem="missing or empty"
+				fi
+			else
+				info "$file has no signed-by; apt uses the global keyrings"
+			fi
+			out=$(source_update "$file")
+			sig=$(signature_error "$out")
+			fetch_err=$(fetch_error "$out")
+			if [ -n "$sig" ] && [ -z "$problem" ]; then problem="apt rejects the signature: $(echo "$sig" | head -1 | sed 's/^ *//')"; fi
+			if [ -z "$problem" ]; then
+				if [ -n "$fetch_err" ]; then
+					warn "$file: repository unreachable or unsupported for this release: $(echo "$fetch_err" | head -1)"
+					broken=1
+				else
+					ok "$file: signature verifies, index refreshed"
+				fi
+				continue
+			fi
+			if [ "$mode" != fix ]; then
+				fail "$file: $problem"
+				broken=1
+				continue
+			fi
+			warn "$file: $problem; repairing"
+			if [ "$keyring" = inline ]; then
+				keyring=/etc/apt/keyrings/php-$kind.gpg
+				fetch_repo_key "$kind" "$keyring"
+				deb822_set_signed_by "$file" "$keyring"
+			elif [ -n "$keyring" ]; then
+				fetch_repo_key "$kind" "$keyring"
+			else
+				fetch_repo_key "$kind" "/etc/apt/trusted.gpg.d/php-$kind.gpg"
+			fi
+			out=$(source_update "$file")
+			sig=$(signature_error "$out")
+			if [ -n "$sig" ]; then
+				fail "$file: still failing after the key refresh: $(echo "$sig" | head -1)"
+				broken=1
+			else
+				ok "$file: fresh $kind key installed, signature verifies"
+			fi
+		done
+		return $broken
+	}
+
+#add sury (debian) or the ondrej ppa (ubuntu) when no php repository is configured
+	repo_add() {
+		local keyring file line out
+		[ -z "$(php_sources)" ] || return 1
+		[ -n "$os_codename" ] || die "cannot tell the release codename from /etc/os-release"
+		step "adding the $(repo_label) repository for $os_codename"
+		has curl || has wget || pkg_install curl
+		pkg_install ca-certificates
+		keyring=/etc/apt/keyrings/php-$repo_kind.gpg
+		fetch_repo_key "$repo_kind" "$keyring"
+		if [ "$repo_kind" = sury ]; then
+			file=/etc/apt/sources.list.d/php-sury.list
+			line="deb [signed-by=$keyring] https://packages.sury.org/php/ $os_codename main"
+		else
+			file=/etc/apt/sources.list.d/php-ondrej.list
+			line="deb [signed-by=$keyring] https://ppa.launchpadcontent.net/ondrej/php/ubuntu $os_codename main"
+		fi
+		echo "$line" > "$file"
+		out=$(source_update "$file")
+		if [ -n "$(signature_error "$out")$(fetch_error "$out")" ]; then
+			rm -f "$file"
+			die "the $(repo_label) repository does not work for $os_codename: $(fetch_error "$out")$(signature_error "$out")"
+		fi
+		ok "added $file"
+	}
+
+#--- php-fpm pools and FastCGI probe ------------------------------------------------------------
+
+#"pool<TAB>listen" for every pool of a version
+	pool_listens() {
+		local f
+		for f in "$(pool_dir "$1")"/*.conf; do
+			[ -f "$f" ] || continue
+			awk '
+				/^[ \t]*[;#]/ { next }
+				/^[ \t]*\[.*\]/ { pool = $0; gsub(/^[ \t]*\[|\][ \t]*$/, "", pool); next }
+				/^[ \t]*listen[ \t]*=/ {
+					v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]*$/, "", v); gsub(/"/, "", v); gsub(/\$pool/, pool, v)
+					if (pool != "") print pool "\t" v
+				}' "$f"
+		done
+	}
+
+#write the probe script and a minimal FastCGI client
+	make_probe() {
+		[ -z "$probe_dir" ] || return 0
+		probe_dir=$(mktemp -d /run/php-switch.XXXXXX)
+		chmod 755 "$probe_dir"
+		printf '%s\n' '<?php echo "php-switch-probe ", PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, "\n";' > "$probe_dir/probe.php"
+		chmod 644 "$probe_dir/probe.php"
+		cat > "$probe_dir/fcgi.php" <<'EOF'
+<?php
+$addr = $argv[1]; $script = $argv[2];
+if (preg_match('/^\d+$/', $addr)) $addr = "127.0.0.1:$addr";
+$addr = str_replace(array('0.0.0.0:', '[::]:'), array('127.0.0.1:', '[::1]:'), $addr);
+$uri = ($addr[0] === '/') ? "unix://$addr" : "tcp://$addr";
+$s = @stream_socket_client($uri, $errno, $errstr, 5);
+if (!$s) { fwrite(STDERR, "cannot connect to $uri: $errstr\n"); exit(2); }
+stream_set_timeout($s, 15);
+function rec($type, $body) { $len = strlen($body); $pad = (8 - $len % 8) % 8; return pack('CCnnCx', 1, $type, 1, $len, $pad) . $body . str_repeat("\0", $pad); }
+function nv($n, $v) { $a = strlen($n); $b = strlen($v); return ($a < 128 ? chr($a) : pack('N', $a | 0x80000000)) . ($b < 128 ? chr($b) : pack('N', $b | 0x80000000)) . $n . $v; }
+$name = '/' . basename($script);
+$params = array('SCRIPT_FILENAME' => $script, 'SCRIPT_NAME' => $name, 'REQUEST_URI' => $name, 'DOCUMENT_URI' => $name,
+	'DOCUMENT_ROOT' => dirname($script), 'REQUEST_METHOD' => 'GET', 'QUERY_STRING' => '', 'SERVER_PROTOCOL' => 'HTTP/1.1',
+	'GATEWAY_INTERFACE' => 'CGI/1.1', 'SERVER_SOFTWARE' => 'php-switch', 'SERVER_NAME' => 'localhost',
+	'SERVER_ADDR' => '127.0.0.1', 'SERVER_PORT' => '80', 'REMOTE_ADDR' => '127.0.0.1', 'REMOTE_PORT' => '0');
+$p = ''; foreach ($params as $k => $v) $p .= nv($k, $v);
+fwrite($s, rec(1, pack('nCx5', 1, 0)) . rec(4, $p) . rec(4, '') . rec(5, ''));
+$out = ''; $err = '';
+while (!feof($s)) {
+	$h = fread($s, 8);
+	if ($h === false || strlen($h) < 8) break;
+	$r = unpack('Cver/Ctype/nid/nlen/Cpad/Cres', $h);
+	$need = $r['len'] + $r['pad']; $body = '';
+	while (strlen($body) < $need) { $c = fread($s, $need - strlen($body)); if ($c === false || $c === '') break 2; $body .= $c; }
+	$body = substr($body, 0, $r['len']);
+	if ($r['type'] == 6) $out .= $body; elseif ($r['type'] == 7) $err .= $body; elseif ($r['type'] == 3) break;
+}
+echo $out;
+if ($err !== '') fwrite(STDERR, $err);
+EOF
+	}
+
+#probe one pool: prints a verdict and returns 0 (ok), 1 (fail) or 2 (answered but could not run the probe)
+	probe_pool() {
+		local version=$1 listen=$2 out
+		make_probe
+		out=$("$(cli_bin "$version")" -n "$probe_dir/fcgi.php" "$listen" "$probe_dir/probe.php" 2>&1 || true)
+		if grep "php-switch-probe $version" <<< "$out" >/dev/null; then
+			echo "php $version answers on $listen"
+			return 0
+		elif grep 'php-switch-probe' <<< "$out" >/dev/null; then
+			echo "$listen is answered by php $(grep -o 'php-switch-probe [0-9.]*' <<< "$out" | head -1 | cut -d' ' -f2), expected $version"
+			return 1
+		elif grep -iE 'File not found|Primary script unknown|No input file|Access denied' <<< "$out" >/dev/null; then
+			echo "$listen answers FastCGI but would not run a file outside its document root (open_basedir or chroot); version not confirmed"
+			return 2
+		else
+			echo "$listen: $(echo "$out" | head -3 | tr '\n' ' ')"
+			return 1
+		fi
+	}
+
+#probe every pool of a version; returns the number of failed pools
+	probe_pools() {
+		local version=$1 pool listen msg rc failures=0
+		while IFS=$'\t' read -r pool listen; do
+			rc=0
+			msg=$(probe_pool "$version" "$listen") || rc=$?
+			case $rc in
+				0) ok "pool $pool: $msg" ;;
+				2) warn "pool $pool: $msg" ;;
+				*) fail "pool $pool: $msg"; failures=$((failures + 1)) ;;
+			esac
+		done < <(pool_listens "$version")
+		return $failures
+	}
+
+#make sure the directories of unix listen sockets exist; a handed-over socket can live in a
+#directory the old php-fpm created
+	ensure_socket_dirs() {
+		local pool listen dir
+		while IFS=$'\t' read -r pool listen; do
+			[ "${listen:0:1}" = / ] || continue
+			dir=$(dirname "$listen")
+			if [ ! -d "$dir" ]; then mkdir -p "$dir"; chmod 755 "$dir"; fi
+		done < <(pool_listens "$1")
+	}
+
+#wait for every unix socket of a version to appear
+	wait_pools() {
+		local pool listen i
+		while IFS=$'\t' read -r pool listen; do
+			[ "${listen:0:1}" = / ] || continue
+			for i in $(seq 1 50); do
+				[ -S "$listen" ] && break
+				sleep 0.2
+			done
+		done < <(pool_listens "$1")
+	}
+
+#debian's version-less /run/php/php-fpm.sock is an update-alternatives group that each php-fpm
+#joins on start and leaves on stop; make sure the target is registered and the group is on auto
+	fix_generic_socket() {
+		local sock alt
+		sock=$(pool_listens "$1" | awk -F'\t' '$1 == "www" {print $2}')
+		[ -n "$sock" ] && [ -S "$sock" ] || return 0
+		[ -x /usr/lib/php/php-fpm-socket-helper ] || return 0
+		if [ -L /run/php/php-fpm.sock ] && [ "$(readlink /run/php/php-fpm.sock)" != /etc/alternatives/php-fpm.sock ]; then
+			rm -f /run/php/php-fpm.sock
+		fi
+		/usr/lib/php/php-fpm-socket-helper install /run/php/php-fpm.sock "$(pool_dir "$1")/www.conf" "${1//./}"
+		#the helper skips its remove on stop because the socket is already gone, so stopped
+		#versions stay registered and can outrank the running one
+		for alt in $(update-alternatives --list php-fpm.sock 2>/dev/null || true); do
+			if [ ! -S "$alt" ]; then update-alternatives --quiet --remove php-fpm.sock "$alt" 2>/dev/null || true; fi
+		done
+		update-alternatives --quiet --auto php-fpm.sock 2>/dev/null || true
+		if [ "$(readlink -f /run/php/php-fpm.sock 2>/dev/null)" = "$sock" ]; then ok "/run/php/php-fpm.sock -> $sock"; fi
+	}
+
+#--- configuration carry-over -------------------------------------------------------------------
+
+#set (or add) "key = value" in an ini-style file; an uncommented key wins over a commented example
+	ini_set() {
+		local file=$1 key=$2 value=$3
+		KEY="$key" VALUE="$value" awk '
+			BEGIN { key = ENVIRON["KEY"]; value = ENVIRON["VALUE"]; done = 0 }
+			{ lines[NR] = $0 }
+			function matches(line, commented,   k) {
+				if (commented) { if (line !~ /^[ \t]*;[ \t]*[A-Za-z0-9_.\[\]]+[ \t]*=/) return 0; sub(/^[ \t]*;[ \t]*/, "", line) }
+				else { if (line !~ /^[ \t]*[A-Za-z0-9_.\[\]]+[ \t]*=/) return 0; sub(/^[ \t]*/, "", line) }
+				k = line; sub(/[ \t]*=.*/, "", k)
+				return k == key
+			}
+			END {
+				for (i = 1; i <= NR && !done; i++) if (matches(lines[i], 0)) { lines[i] = key " = " value; done = 1 }
+				for (i = 1; i <= NR && !done; i++) if (matches(lines[i], 1)) { lines[i] = key " = " value; done = 1 }
+				for (i = 1; i <= NR; i++) print lines[i]
+				if (!done) print key " = " value
+			}
+		' "$file" > "$file.tmp" && cat "$file.tmp" > "$file" && rm -f "$file.tmp"
+	}
+
+#comment out a key
+	ini_unset() {
+		KEY="$2" awk '
+			BEGIN { key = ENVIRON["KEY"] }
+			{ line = $0; sub(/^[ \t]*/, "", line); k = line; sub(/[ \t]*=.*/, "", k)
+			  if (line !~ /^;/ && k == key) print "; " $0 " ; disabled by php-switch, rejected by this php version"; else print }
+		' "$1" > "$1.tmp" && cat "$1.tmp" > "$1" && rm -f "$1.tmp"
+	}
+
+#"key<TAB>value" for every uncommented directive in an ini-style file
+	ini_directives() {
+		awk '
+			/^[ \t]*[;#]/ || /^[ \t]*\[/ || !/=/ { next }
+			{
+				line = $0; sub(/^[ \t]*/, "", line)
+				key = line; sub(/[ \t]*=.*/, "", key)
+				value = line; sub(/^[^=]*=[ \t]*/, "", value); sub(/[ \t]*$/, "", value)
+				print key "\t" value
+			}' "$1"
+	}
+
+	ini_value() {
+		ini_directives "$1" | awk -F'\t' -v k="$2" '$1 == k {v = $2} END {print v}'
+	}
+
+#carry over the php.ini directives changed from the packaged template
+	carried_keys=''
+	merge_php_ini() {
+		local from=$1 to=$2 sapi=$3 src dst template key value
+		src=$(ini_file "$from" "$sapi")
+		dst=$(ini_file "$to" "$sapi")
+		[ -f "$src" ] && [ -f "$dst" ] || return 0
+		template=$(ini_template "$from" "$sapi")
+		[ -n "$template" ] || { warn "no packaged php.ini for php $from $sapi; php.ini not carried over"; return 0; }
+		for key in $(ini_directives "$src" | cut -f1 | sort -u); do
+			case "$key" in extension|zend_extension) continue ;; esac
+			value=$(ini_value "$src" "$key")
+			[ "$(ini_value "$template" "$key")" != "$value" ] || continue
+			value=$(subst_version "$from" "$to" <<< "$value")
+			[ "$(ini_value "$dst" "$key")" != "$value" ] || continue
+			ini_set "$dst" "$key" "$value"
+			carried_keys="$carried_keys$dst	$key
+"
+			ok "$sapi php.ini: $key = $value"
+		done
+	}
+
+#carry over php-fpm.conf and pool settings, rewriting version-specific paths
+	merge_fpm() {
+		local from=$1 to=$2 src dst pool name key value
+		src=$(fpm_conf "$from")
+		dst=$(fpm_conf "$to")
+		if [ -f "$src" ] && [ -f "$dst" ]; then
+			while IFS=$'\t' read -r key value; do
+				case "$key" in include|pid|error_log|syslog.ident) continue ;; esac
+				value=$(subst_version "$from" "$to" <<< "$value")
+				if [ "$(ini_value "$dst" "$key")" != "$value" ]; then
+					ini_set "$dst" "$key" "$value"
+					ok "php-fpm.conf: $key = $value"
+				fi
+			done < <(ini_directives "$src")
+		fi
+		mkdir -p "$(pool_dir "$to")"
+		for pool in "$(pool_dir "$from")"/*.conf; do
+			[ -f "$pool" ] || continue
+			name=$(basename "$pool")
+			if [ ! -f "$(pool_dir "$to")/$name" ]; then
+				subst_version "$from" "$to" < "$pool" > "$(pool_dir "$to")/$name"
+				ok "pool: copied $name"
+				continue
+			fi
+			while IFS=$'\t' read -r key value; do
+				value=$(subst_version "$from" "$to" <<< "$value")
+				if [ "$(ini_value "$(pool_dir "$to")/$name" "$key")" != "$value" ]; then
+					ini_set "$(pool_dir "$to")/$name" "$key" "$value"
+					ok "pool $name: $key = $value"
+				fi
+			done < <(ini_directives "$pool")
+		done
+	}
+
+#copy conf.d files the admin added (regular files no package owns, not ionCube)
+	merge_conf_d() {
+		local from=$1 to=$2 sapi file name src dst
+		for sapi in fpm cli; do
+			src=$(confd "$from" "$sapi")
+			dst=$(confd "$to" "$sapi")
+			[[ -d "$src" && -d "$dst" ]] || continue
+			for file in "$src"/*.ini; do
+				[[ -f "$file" && ! -L "$file" ]] || continue
+				name=$(basename "$file")
+				[ ! -e "$dst/$name" ] || continue
+				if grep -i 'ioncube' "$file" >/dev/null; then continue; fi
+				if dpkg -S "$file" >/dev/null 2>&1; then continue; fi
+				if grep -E '^[ \t]*(zend_)?extension[ \t]*=[ \t]*"?/' "$file" >/dev/null; then
+					warn "$name loads an extension by absolute path; build it for php $to and copy it yourself"
+					continue
+				fi
+				subst_version "$from" "$to" < "$file" > "$dst/$name"
+				ok "$sapi conf.d: copied $name"
+			done
+		done
+	}
+
+#ionCube loader for the target when the source uses it
+	install_ioncube() {
+		local from=$1 to=$2 sapi ini_name='' ext_dir loader source tmp='' arch f
+		for sapi in fpm cli; do
+			for f in "$(confd "$from" "$sapi")"/*.ini; do
+				if [ -f "$f" ] && grep -iE '^[ \t]*zend_extension.*ioncube' "$f" >/dev/null; then ini_name=$(basename "$f"); fi
+			done
+		done
+		[ -n "$ini_name" ] || return 0
+		if "$(cli_bin "$to")" -v 2>&1 | grep 'ionCube' >/dev/null; then
+			ok "ionCube already loads on php $to"
+			return 0
+		fi
+		ext_dir=$("$(cli_bin "$to")" -n -r 'echo ini_get("extension_dir");')
+		loader=ioncube_loader_lin_$to.so
+		source=${IONCUBE_DIR:-/nonexistent}/$loader
+		if [ ! -f "$source" ]; then
+			case "$(uname -m)" in
+				x86_64) arch=x86-64 ;;
+				aarch64) arch=aarch64 ;;
+				*) warn "no ionCube loader download for $(uname -m)"; return 0 ;;
+			esac
+			has unzip || pkg_install unzip
+			tmp=$(mktemp -d)
+			if fetch "https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_$arch.zip" "$tmp/ioncube.zip" \
+				&& unzip -q "$tmp/ioncube.zip" -d "$tmp" && [ -f "$tmp/ioncube/$loader" ]; then
+				source=$tmp/ioncube/$loader
+			else
+				warn "no ionCube loader for php $to yet; ionCube-encoded files will not run on it"
+				rm -rf "$tmp"
+				return 0
+			fi
+		fi
+		install -m 644 "$source" "$ext_dir/$loader"
+		if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+		for sapi in fpm cli; do
+			echo "zend_extension = $ext_dir/$loader" > "$(confd "$to" "$sapi")/$ini_name"
+		done
+		if "$(cli_bin "$to")" -v 2>&1 | grep 'ionCube' >/dev/null; then
+			ok "ionCube $("$(cli_bin "$to")" -v | grep -oE 'ionCube PHP Loader v[0-9.]+' || true)"
+		else
+			warn "the ionCube loader does not load on php $to; removed"
+			for sapi in fpm cli; do rm -f "$(confd "$to" "$sapi")/$ini_name"; done
+		fi
+	}
+
+#systemd drop-ins of the source php-fpm unit
+	merge_dropins() {
+		local from=$1 to=$2 src dst f
+		src=/etc/systemd/system/$(fpm_service "$from").service.d
+		dst=/etc/systemd/system/$(fpm_service "$to").service.d
+		[ -d "$src" ] || return 0
+		mkdir -p "$dst"
+		for f in "$src"/*.conf; do
+			[ -f "$f" ] || continue
+			# shellcheck disable=SC2094 # reads $src/x.conf, writes $dst/x.conf
+			subst_version "$from" "$to" < "$f" > "$dst/$(basename "$f")"
+			ok "systemd drop-in: $(basename "$f")"
+		done
+		systemctl daemon-reload
+	}
+
+#--- validation ---------------------------------------------------------------------------------
+
+#startup complaints from the cli and php-fpm
+	startup_issues() {
+		{
+			"$(cli_bin "$1")" -v 2>&1 || true
+			if [ -x "$(fpm_bin "$1")" ]; then "$(fpm_bin "$1")" -m 2>&1 || true; fi
+		} | grep -iE '(PHP )?(Warning|Deprecated|Fatal error|Parse error|Notice|Startup)|Unable to load|Failed loading|Cannot load' | sort -u || true
+	}
+
+#loaded extensions, lower case
+	ext_list() {
+		"$1" -m 2>/dev/null | grep -vE '^\[|^$' | tr '[:upper:]' '[:lower:]' | sort -u || true
+	}
+
+#extensions loaded from ini files rather than compiled in; only these can go missing in a switch,
+#compiled-in ones (random in 8.2, lexbor and uri in 8.5) come and go with the php version itself
+	shared_ext_list() {
+		comm -23 <(ext_list "$1") <("$1" -n -m 2>/dev/null | grep -vE '^\[|^$' | tr '[:upper:]' '[:lower:]' | sort -u || true)
+	}
+
+#every .php file under a directory that does not parse; one file per process because php < 8.3
+#only lints its first argument
+	lint_tree() {
+		# shellcheck disable=SC2016 # $0 and $1 belong to the sh -c script
+		find "$2" -name '*.php' -not -path '*/node_modules/*' -print0 \
+			| xargs -0 -r -n 1 -P "$(nproc 2>/dev/null || echo 2)" sh -c '"$0" -l "$1" >/dev/null 2>&1 || echo "$1"' "$(cli_bin "$1")" | sort
+	}
+
+#php-fpm -t, startup warnings (disabling carried keys that cause them), extension parity, lint
+	validate_target() {
+		local from=$1 to=$2 target_fpm=$3 issues key file missing dir regressions count
+		if $target_fpm; then
+			if ! "$(fpm_bin "$to")" -t >/dev/null 2>&1; then "$(fpm_bin "$to")" -t >&2 || true; die "php-fpm$to -t failed"; fi
+			ok "php-fpm$to -t"
+		fi
+		issues=$(startup_issues "$to")
+		if [ -n "$issues" ] && [ -n "$carried_keys" ]; then
+			while IFS=$'\t' read -r file key; do
+				[ -n "$key" ] || continue
+				if grep -F "$key" <<< "$issues" >/dev/null; then
+					ini_unset "$file" "$key"
+					warn "$key is rejected by php $to; disabled in $file"
+				fi
+			done <<< "$carried_keys"
+			issues=$(startup_issues "$to")
+		fi
+		if [ -n "$issues" ]; then echo "$issues" >&2; die "php $to reports startup problems"; fi
+		ok "no startup warnings"
+		missing=$(comm -23 <(shared_ext_list "$(cli_bin "$from")") <(ext_list "$(cli_bin "$to")") | tr '\n' ' ')
+		if $target_fpm && [ -x "$(fpm_bin "$from")" ]; then
+			missing="$missing$(comm -23 <(shared_ext_list "$(fpm_bin "$from")") <(ext_list "$(fpm_bin "$to")") | tr '\n' ' ')"
+		fi
+		missing=$(tr ' ' '\n' <<< "$missing" | grep -v '^$' | sort -u | tr '\n' ' ' || true)
+		if [ -n "$missing" ]; then
+			if $allow_missing_ext; then
+				warn "extensions missing on php $to: $missing"
+			else
+				die "extensions loaded by php $from are missing on php $to: $missing(pass --allow-missing-ext to continue)"
+			fi
+		else
+			ok "extensions match php $from"
+		fi
+		for dir in "${lint_dirs[@]}"; do
+			count=$(find "$dir" -name '*.php' -not -path '*/node_modules/*' | wc -l)
+			regressions=''
+			for file in $(lint_tree "$to" "$dir"); do
+				if "$(cli_bin "$from")" -l "$file" >/dev/null 2>&1; then
+					regressions="$regressions $file"
+				else
+					warn "fails on php $from too: $file"
+				fi
+			done
+			if [ -n "$regressions" ]; then
+				for file in $regressions; do "$(cli_bin "$to")" -l "$file" 2>&1 | grep -v '^Errors parsing' >&2 || true; done
+				die "$(wc -w <<< "$regressions") file(s) under $dir parse on php $from but not on php $to"
+			fi
+			ok "php -l: no new parse errors in $count files under $dir"
+		done
+	}
+
+#--- web servers --------------------------------------------------------------------------------
+
+#"server<TAB>file" for every config file a web server loads
+	web_config_files() {
+		if has nginx; then
+			{ nginx -T 2>/dev/null || true; } | sed -n 's/^# configuration file \(.*\):$/\1/p' | awk '{print "nginx\t" $0}'
+		fi
+		if has apache2ctl; then
+			{ apache2ctl -t -D DUMP_INCLUDES 2>/dev/null || true; } | grep -oE '/[^ ]+$' | awk '{print "apache\t" $0}' || true
+		fi
+		if [ -d /etc/caddy ]; then find /etc/caddy -type f | awk '{print "caddy\t" $0}'; fi
+		if [ -d /etc/lighttpd ]; then find /etc/lighttpd -type f | awk '{print "lighttpd\t" $0}'; fi
+	}
+
+	web_test() {
+		case "$1" in
+			nginx) nginx -t 2>&1 ;;
+			apache) apache2ctl -t 2>&1 ;;
+			caddy) caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1 ;;
+			lighttpd) lighttpd -tt -f /etc/lighttpd/lighttpd.conf 2>&1 ;;
+		esac
+	}
+
+	web_reload() {
+		case "$1" in
+			nginx) if systemctl is-active --quiet nginx; then systemctl reload nginx; else nginx -s reload; fi ;;
+			apache) apache2ctl -k graceful 2>/dev/null ;;
+			caddy) systemctl reload caddy ;;
+			lighttpd) systemctl restart lighttpd ;;
+		esac
+	}
+
+	sed_re() { printf '%s' "$1" | sed -e 's/[]\/$*.^[#]/\\&/g'; }
+	sed_repl() { printf '%s' "$1" | sed -e 's/[\/&#]/\\&/g'; }
+
+#alternate spellings of a unix socket path (/run vs /var/run)
+	socket_aliases() {
+		echo "$1"
+		case "$1" in
+			/run/*) echo "/var$1" ;;
+			/var/run/*) echo "${1#/var}" ;;
+		esac
+	}
+
+#--- dependent processes ------------------------------------------------------------------------
+
+#"pid<TAB>exe<TAB>argv0" for php cli / cgi processes in this mount namespace
+	php_processes() {
+		local d exe base argv0 self_ns
+		self_ns=$(readlink /proc/self/ns/mnt)
+		for d in /proc/[0-9]*; do
+			exe=$(readlink "$d/exe" 2>/dev/null) || continue
+			exe=${exe% (deleted)}
+			base=${exe##*/}
+			[[ "$base" =~ ^php(-cgi)?[0-9.]*$ ]] || continue
+			[ "$(readlink "$d/ns/mnt" 2>/dev/null)" = "$self_ns" ] || continue
+			argv0=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -1 || true)
+			printf '%s\t%s\t%s\n' "${d#/proc/}" "$exe" "$argv0"
+		done
+	}
+
+	load_supervisor() {
+		local name state pid
+		sup_pid=()
+		has supervisorctl || return 0
+		while read -r name state _ pid _; do
+			[ "$state" = RUNNING ] || continue
+			sup_pid[${pid%,}]=$name
+		done < <(supervisorctl status 2>/dev/null || true)
+	}
+
+#"kind<TAB>name" that owns a process: supervisor program, systemd unit, cron, or other
+	process_owner() {
+		local pid=$1 p=$1 cg unit
+		while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do
+			if [ -n "${sup_pid[$p]:-}" ]; then
+				printf 'supervisor\t%s\n' "${sup_pid[$p]}"
+				return 0
+			fi
+			p=$(awk '{sub(/.*\) /, ""); print $2}' "/proc/$p/stat" 2>/dev/null || true)
+		done
+		cg=$(awk -F: '$1 == "0" || $2 ~ /name=systemd/ {print $3; exit}' "/proc/$pid/cgroup" 2>/dev/null || true)
+		unit=$(tr '/' '\n' <<< "$cg" | grep -E '\.(service|scope)$' | tail -1 || true)
+		case "$cg" in
+			*/user@*) printf 'other\tuser session %s\n' "$unit"; return 0 ;;
+		esac
+		case "$unit" in
+			cron.service) printf 'cron\t%s\n' "${unit%.service}" ;;
+			*.service) printf 'systemd\t%s\n' "${unit%.service}" ;;
+			*) printf 'other\t%s\n' "${unit:-no service manager}" ;;
+		esac
+	}
+
+#which installed version a php executable belongs to
+	exe_version() {
+		local v
+		for v in $(installed_versions); do
+			if [ "$(readlink -f "$(cli_bin "$v")" 2>/dev/null)" = "$1" ] || [ "$(readlink -f "$(cgi_bin "$v")" 2>/dev/null)" = "$1" ]; then
+				echo "$v"
+				return 0
+			fi
+		done
+		echo "?"
+	}
+
+#find what runs the default php (old) and decide what a switch does to each; fills dep_units,
+#dep_programs and dep_report
+	scan_dependents() {
+		local old=$1 pid exe argv0 kind name version action key
+		local -A seen=()
+		dep_units=''; dep_programs=''; dep_report=''
+		load_supervisor
+		while IFS=$'\t' read -r pid exe argv0; do
+			IFS=$'\t' read -r kind name < <(process_owner "$pid")
+			version=$(exe_version "$exe")
+			if [ "$version" != "$old" ]; then
+				action="runs php $version; not affected"
+			elif [[ "$argv0" =~ php(-cgi)?[0-9] ]]; then
+				action="started as $argv0; stays on php $old"
+			elif [ "$kind" = cron ]; then
+				action="cron job; its next run uses the new default"
+			elif ! $restart_dependents; then
+				action="would restart (skipped: --no-restart)"
+			elif [ "$kind" = systemd ]; then
+				action="restart"
+				case " $dep_units " in *" $name "*) ;; *) dep_units="$dep_units $name" ;; esac
+			elif [ "$kind" = supervisor ]; then
+				action="restart"
+				case " $dep_programs " in *" $name "*) ;; *) dep_programs="$dep_programs $name" ;; esac
+			else
+				action="not under systemd or supervisor; restart it yourself"
+			fi
+			key="$kind $name $action"
+			if [ -z "${seen[$key]:-}" ]; then
+				seen[$key]=1
+				dep_report="$dep_report$(printf '%-10s %-34s %s' "$kind" "$name" "$action")
+"
+			fi
+		done < <(php_processes)
+		dep_units=${dep_units# }
+		dep_programs=${dep_programs# }
+	}
+
+#wait up to 30s for units to be active with a stable main pid
+	wait_units() {
+		local unit i pids previous='' restarts
+		for i in $(seq 1 15); do
+			pids=''
+			for unit in "$@"; do
+				if systemctl is-active --quiet "$unit"; then
+					pids="$pids $(systemctl show -p MainPID --value "$unit")"
+				else
+					pids="$pids x"
+				fi
+			done
+			if [ "$pids" = "$previous" ] && ! grep ' x' <<< "$pids" >/dev/null; then
+				for unit in "$@"; do
+					restarts=$(systemctl show -p NRestarts --value "$unit" 2>/dev/null || echo 0)
+					if [ "${restarts:-0}" -gt 0 ]; then warn "$unit recovered after $restarts automatic restart(s)"; fi
+				done
+				return 0
+			fi
+			previous=$pids
+			sleep 2
+		done
+		return 1
+	}
+
+#restart dependents; returns non-zero when one does not come back
+	restart_dependents_now() {
+		local unit program state rc=0
+		if [ -n "$dep_units" ]; then
+			# shellcheck disable=SC2086
+			systemctl restart $dep_units || rc=1
+			# shellcheck disable=SC2086
+			wait_units $dep_units || true
+			for unit in $dep_units; do
+				if systemctl is-active --quiet "$unit"; then ok "systemd $unit"; else fail "systemd $unit is $(systemctl is-active "$unit" || true)"; rc=1; fi
+			done
+		fi
+		if [ -n "$dep_programs" ]; then
+			# shellcheck disable=SC2086
+			supervisorctl restart $dep_programs >/dev/null || rc=1
+			for program in $dep_programs; do
+				state=$(supervisorctl status "$program" 2>/dev/null | awk '{print $2}' || true)
+				if [ "$state" = RUNNING ]; then ok "supervisor $program"; else fail "supervisor $program is ${state:-unknown}"; rc=1; fi
+			done
+		fi
+		return $rc
+	}
+
+#php errors logged by restarted units since the switch began
+	report_journal() {
+		local unit count
+		[ -n "$dep_units" ] || return 0
+		for unit in $dep_units; do
+			count=$(journalctl -u "$unit" --since "@$1" -o cat 2>/dev/null | grep -cE 'PHP (Fatal|Parse) error' || true)
+			if [ "$count" -gt 0 ]; then warn "$unit logged $count PHP fatal error(s) since the switch (journalctl -u $unit)"; fi
+		done
+	}
+
+#--- default cli --------------------------------------------------------------------------------
+
+	default_cli_version() {
+		local real v
+		real=$(readlink -f /usr/bin/php 2>/dev/null || true)
+		if [ -z "$real" ] || [ ! -e "$real" ]; then echo none; return 0; fi
+		for v in $(installed_versions); do
+			if [ "$(readlink -f "$(cli_bin "$v")")" = "$real" ]; then echo "$v"; return 0; fi
+		done
+		echo unknown
+	}
+
+#point the php alternatives (php, phar, phpize, php-config, ...) at a version; also used to pin
+#them before installing, since apt would otherwise move /usr/bin/php to the highest version
+	set_default_cli() {
+		local alt
+		for alt in $alternatives; do
+			if [ -e "/usr/bin/$alt$1" ]; then update-alternatives --set "$alt" "/usr/bin/$alt$1" >/dev/null 2>&1 || true; fi
+		done
+	}
+
+#--- commands -----------------------------------------------------------------------------------
+
+#versions whose php-fpm is running
+	running_fpm_versions() {
+		local v
+		for v in $(installed_versions); do
+			if [ -x "$(fpm_bin "$v")" ] && systemctl is-active --quiet "$(fpm_service "$v")"; then echo "$v"; fi
+		done
+	}
+
+	cmd_status() {
+		local v state pool listen
+		echo "platform: $os_name ($(repo_label))"
+		echo "default cli: /usr/bin/php -> $(readlink -f /usr/bin/php 2>/dev/null || echo none)"
+		echo "installed:"
+		for v in $(installed_versions); do
+			if [ -x "$(fpm_bin "$v")" ]; then
+				state=$(systemctl is-active --quiet "$(fpm_service "$v")" && echo running || echo stopped)
+				printf '  %-6s %-14s %s, %s\n' "$v" "$(fpm_service "$v")" "$state" "$(systemctl is-enabled "$(fpm_service "$v")" 2>/dev/null || true)"
+				if [ "$state" = running ]; then
+					while IFS=$'\t' read -r pool listen; do printf '         pool %-12s %s\n' "$pool" "$listen"; done < <(pool_listens "$v")
+				fi
+			else
+				printf '  %-6s %s\n' "$v" "(cli only)"
+			fi
+		done
+	}
+
+	cmd_list() {
+		local version candidate tags installed
+		installed=" $(installed_versions | tr '\n' ' ') "
+		while IFS=$'\t' read -r version candidate; do
+			tags=''
+			if is_prerelease "$candidate"; then tags="$tags [prerelease]"; fi
+			case "$installed" in *" $version "*) tags="$tags (installed)" ;; esac
+			printf '  %-6s %s%s\n' "$version" "$candidate" "$tags"
+		done < <(available_versions)
+		if [ -z "$(php_sources)" ]; then info "only the distro's php is listed; 'php-switch repo' or a switch adds $(repo_label)"; fi
+	}
+
+	cmd_repo() {
+		[ "$(id -u)" = 0 ] || die "repo needs root"
+		step "php repository ($(repo_label))"
+		if $check_only; then
+			repo_check check
+		elif [ -z "$(php_sources)" ]; then
+			repo_add
+		else
+			repo_check fix
+		fi
+	}
+
+	cmd_services() {
+		local old
+		old=$(default_cli_version)
+		echo "default cli: php $old"
+		scan_dependents "$old"
+		if [ -z "$dep_report" ]; then
+			echo "no php cli processes running"
+		else
+			printf '%-10s %-34s %s\n' KIND NAME "ON SWITCH"
+			printf '%s' "$dep_report"
+		fi
+	}
+
+	http_code() {
+		local code
+		has curl || die "--check-url needs curl"
+		code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || true)
+		echo "${code:-000}"
+	}
+
+	cmd_check() {
+		local v failures=0 url code versions
+		versions=$(running_fpm_versions)
+		[ -n "$versions" ] || info "no php-fpm running"
+		for v in $versions; do
+			step "php $v ($(fpm_service "$v"))"
+			probe_pools "$v" || failures=$((failures + $?))
+		done
+		for url in "${check_urls[@]}"; do
+			code=$(http_code "$url")
+			if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then ok "$url -> $code"; else fail "$url -> $code"; failures=$((failures + 1)); fi
+		done
+		return $failures
+	}
+
+#resolve "latest" or check an explicit version, adding the repository when it is needed
+	resolve_version() {
+		local wanted=$1 version candidate found='' added=false
+		if [ "$wanted" = latest ] && [ -z "$(php_sources)" ]; then
+			if $dry_run; then
+				info "no php repository configured; a real switch adds $(repo_label) first, so 'latest' below is only the distro's version" >&2
+			elif repo_add >&2; then
+				added=true
+			fi
+		fi
+		while true; do
+			found=''
+			if [ "$wanted" = latest ]; then
+				while IFS=$'\t' read -r version candidate; do
+					if is_prerelease "$candidate" && ! $allow_prerelease; then continue; fi
+					found=$version
+				done < <(available_versions | sort -V)
+			else
+				[[ "$wanted" =~ ^[0-9]+\.[0-9]+$ ]] || die "version must look like 8.4, or be 'latest'"
+				while IFS=$'\t' read -r version candidate; do
+					if [ "$version" = "$wanted" ]; then
+						if is_prerelease "$candidate" && ! $allow_prerelease && [ ! -x "$(cli_bin "$wanted")" ]; then
+							die "php $wanted is a prerelease ($candidate); pass --allow-prerelease to use it"
+						fi
+						found=$wanted
+					fi
+				done < <(available_versions)
+				if [ -z "$found" ] && [ -x "$(cli_bin "$wanted")" ]; then found=$wanted; fi
+			fi
+			if [ -n "$found" ]; then echo "$found"; return 0; fi
+			if ! $added && ! $dry_run && repo_add >&2; then added=true; continue; fi
+			if $dry_run && [ -z "$(php_sources)" ]; then die "php $wanted is not in the distro repositories; a real switch adds $(repo_label) first"; fi
+			die "php $wanted is not available on $os_name; see: php-switch list"
+		done
+	}
+
+#the version being switched away from: the running php-fpm, else the default cli
+	source_version() {
+		local running count
+		if [ -n "$from_arg" ]; then
+			[ -x "$(cli_bin "$from_arg")" ] || die "--from $from_arg is not installed"
+			echo "$from_arg"
+			return 0
+		fi
+		running=$(running_fpm_versions)
+		count=$(grep -c . <<< "$running" || true)
+		if [ "$count" -gt 1 ]; then die "several php-fpm versions are running ($(tr '\n' ' ' <<< "$running")); pass --from"; fi
+		if [ "$count" -eq 1 ]; then echo "$running"; return 0; fi
+		default_cli_version
+	}
+
+	backup_file() {
+		local f
+		for f in "$@"; do
+			[[ -n "$f" && -e "$f" ]] || continue
+			mkdir -p "$backup$(dirname "$f")"
+			cp -a "$f" "$backup$f"
+		done
+	}
+
+	cmd_switch() {
+		local target from cli_before answer v suffix suffixes packages='' skipped='' names
+		local from_fpm=false target_fpm=false handover=false switch_cli=false
+		local pool listen new_listen file server line apache_conf=false apache_mod=false mods_before='' reload_list
+		local -a old_pools=() new_pools=() web_targets=() web_servers=() baseline=()
+		local -A web_seen=()
+		local log_since url code i
+		[ "$(id -u)" = 0 ] || die "switch must run as root"
+
+		#1. repository
+			step "checking the php repository"
+			if $dry_run; then repo_check check || true; else repo_check fix || warn "continuing with a repository problem"; fi
+			target=$(resolve_version "$1")
+			from=$(source_version)
+			cli_before=$(default_cli_version)
+			[[ "$from" != none && "$from" != unknown ]] || die "no php installed to switch from; install php$target with apt"
+			if [ "$target" = "$from" ] && [ "$cli_before" = "$target" ]; then
+				echo "php $target is already active"
+				cmd_check
+				return
+			fi
+
+		#plan: packages; opcache is always tried because 8.5+ compiles it in and older versions need the package
+			suffixes=$( (echo cli; echo opcache; installed_suffixes "$from") | sort -u)
+			names=" $(available_names "$target" | tr '\n' ' ') "
+			for suffix in $suffixes; do
+				v=$(pkg_name "$target" "$suffix")
+				case "$names" in
+					*" $v "*) packages="$packages $v" ;;
+					*) if [ "$suffix" != opcache ]; then skipped="$skipped $suffix"; fi ;;
+				esac
+			done
+			if [ -x "$(fpm_bin "$from")" ]; then from_fpm=true; fi
+			case " $packages " in *"-fpm "*) target_fpm=true ;; esac
+			if $from_fpm && [ -x "$(fpm_bin "$target")" ]; then target_fpm=true; fi
+
+		#plan: pools and web configs
+			if $from_fpm && $target_fpm && [ "$from" != "$target" ]; then
+				while IFS=$'\t' read -r pool listen; do
+					new_listen=$(subst_version "$from" "$target" <<< "$listen")
+					old_pools+=("$pool	$listen")
+					new_pools+=("$pool	$new_listen")
+					if [ "$new_listen" = "$listen" ]; then handover=true; fi
+				done < <(pool_listens "$from")
+				while IFS=$'\t' read -r server file; do
+					file=$(readlink -f "$file" 2>/dev/null || echo "$file")
+					[[ -f "$file" && -z "${web_seen[$file]:-}" ]] || continue
+					if [[ "$file" == /etc/apache2/conf-available/php*-fpm.conf ]]; then continue; fi
+					for i in "${!old_pools[@]}"; do
+						listen=${old_pools[$i]#*	}
+						new_listen=${new_pools[$i]#*	}
+						[[ "$listen" != "$new_listen" && "${listen:0:1}" = / ]] || continue
+						while read -r line; do
+							if grep -F "$line" "$file" >/dev/null 2>&1; then
+								web_seen[$file]=1
+								web_targets+=("$file")
+								web_servers+=("$server")
+								break 2
+							fi
+						done < <(socket_aliases "$listen")
+					done
+				done < <(web_config_files | sort -u)
+				if [ -e "/etc/apache2/conf-enabled/php$from-fpm.conf" ]; then apache_conf=true; fi
+			fi
+			if [ -e "/etc/apache2/mods-enabled/php$from.load" ] && [ "$from" != "$target" ]; then apache_mod=true; fi
+			if [ "$cli_before" != "$target" ]; then switch_cli=true; fi
+			scan_dependents "$cli_before"
+
+		#show the plan
+			echo
+			echo "switch php $from -> php $target on $os_name"
+			[ -z "$packages" ] || echo "  install:$packages"
+			[ -z "$skipped" ] || echo "  not packaged for the target (built in or dropped):$skipped"
+			for i in "${!old_pools[@]}"; do
+				echo "  pool ${old_pools[$i]%%	*}: ${old_pools[$i]#*	} -> ${new_pools[$i]#*	}"
+			done
+			if $handover; then echo "  php-fpm: hand over (a pool keeps its address, so the old php-fpm stops before the new one starts)"; fi
+			for i in "${!web_targets[@]}"; do echo "  ${web_servers[$i]}: ${web_targets[$i]}"; done
+			if $apache_conf; then echo "  apache: a2disconf php$from-fpm, a2enconf php$target-fpm"; fi
+			if $apache_mod; then echo "  apache: a2dismod php$from, a2enmod php$target"; fi
+			if $switch_cli; then echo "  /usr/bin/php: php $cli_before -> php $target"; fi
+			if [ -n "$dep_report" ]; then echo "  processes running php:"; printf '%s' "$dep_report" | sed 's/^/    /'; fi
+			echo
+			if $dry_run; then return 0; fi
+			if ! $assume_yes; then
+				read -r -p "continue? [y/N] " answer
+				[[ "$answer" =~ ^[yY]$ ]] || exit 1
+			fi
+
+		#2. packages
+			backup=$backup_root/$(date +%Y%m%d-%H%M%S)
+			mkdir -p "$backup"
+			if [ "$cli_before" != none ] && [ "$cli_before" != unknown ]; then set_default_cli "$cli_before"; fi
+			if [ -d /etc/apache2/mods-enabled ]; then mods_before=$(find /etc/apache2/mods-enabled -maxdepth 1 -name 'php*.load' -printf '%f\n'); fi
+			if [ -n "$packages" ]; then
+				step "installing php $target"
+				# shellcheck disable=SC2086
+				pkg_install $packages
+				ok "installed:$packages"
+			fi
+			if [ -n "$skipped" ]; then warn "not packaged for php $target (built in or dropped):$skipped"; fi
+			if [ -d /etc/apache2/mods-enabled ]; then
+				for v in /etc/apache2/mods-enabled/php*.load; do
+					[ -e "$v" ] || continue
+					v=${v##*/}
+					if [[ "$v" =~ ^php[0-9.]+\.load$ ]] && ! grep -x "$v" <<< "$mods_before" >/dev/null; then
+						a2dismod -q "${v%.load}" >/dev/null 2>&1 || true
+						info "the package enabled ${v%.load} in apache; disabled until the switch"
+					fi
+				done
+			fi
+			if $target_fpm && [ "$from" != "$target" ]; then
+				systemctl disable --quiet "$(fpm_service "$target")" 2>/dev/null || true
+				systemctl stop "$(fpm_service "$target")" 2>/dev/null || true
+			fi
+
+		#3. configuration
+			if [ "$from" != "$target" ]; then
+				step "carrying over configuration from php $from"
+				for v in fpm cli; do backup_file "$(ini_file "$target" "$v")" "$(confd "$target" "$v")"; done
+				backup_file "$(fpm_conf "$target")" "$(pool_dir "$target")"
+				for v in fpm cli; do merge_php_ini "$from" "$target" "$v"; done
+				if $from_fpm && $target_fpm; then merge_fpm "$from" "$target"; merge_dropins "$from" "$target"; fi
+				merge_conf_d "$from" "$target"
+				install_ioncube "$from" "$target"
+			fi
+
+		#4. validation
+			step "validating php $target"
+			validate_target "$from" "$target" "$target_fpm"
+
+		#from here on, failures roll back
+			for url in "${check_urls[@]}"; do
+				code=$(http_code "$url")
+				if [ "$code" = 000 ]; then die "$url does not answer before the switch; fix it or drop --check-url"; fi
+				baseline+=("$code")
+			done
+			log_since=$(date +%s)
+			backup_file "${web_targets[@]}"
+			from_fpm_running=false
+			if $from_fpm && systemctl is-active --quiet "$(fpm_service "$from")"; then from_fpm_running=true; fi
+			rb_from=$from rb_target=$target rb_cli=$cli_before rb_backup=$backup rb_handover=$handover
+			rb_apache_conf=$apache_conf rb_apache_mod=$apache_mod rb_target_fpm=$target_fpm rb_from_fpm=$from_fpm_running
+			rb_web_files=("${web_targets[@]}") rb_web_servers=("${web_servers[@]}")
+			trap rollback ERR
+
+		#5. php-fpm
+			if $target_fpm && [ "$from" != "$target" ]; then
+				if $handover; then
+					step "handing over php-fpm (shared listen address)"
+					if $from_fpm_running; then systemctl stop "$(fpm_service "$from")"; fi
+				else
+					step "starting $(fpm_service "$target") beside $(fpm_service "$from")"
+				fi
+				ensure_socket_dirs "$target"
+				systemctl enable --quiet "$(fpm_service "$target")"
+				systemctl restart "$(fpm_service "$target")"
+				wait_pools "$target"
+				probe_pools "$target" || false
+			fi
+
+		#6. web servers
+			if [ "${#web_targets[@]}" -gt 0 ] || $apache_conf || $apache_mod; then
+				step "pointing web servers at php $target"
+				for file in "${web_targets[@]}"; do
+					for i in "${!old_pools[@]}"; do
+						listen=${old_pools[$i]#*	}
+						new_listen=${new_pools[$i]#*	}
+						[ "$listen" != "$new_listen" ] || continue
+						while read -r line; do
+							sed -i "s#$(sed_re "$line")#$(sed_repl "${line/$listen/$new_listen}")#g" "$file"
+						done < <(socket_aliases "$listen")
+					done
+					ok "rewrote $file"
+				done
+				if $apache_conf; then a2disconf -q "php$from-fpm" >/dev/null; a2enconf -q "php$target-fpm" >/dev/null; ok "apache conf php$target-fpm"; fi
+				if $apache_mod; then a2dismod -q "php$from" >/dev/null; a2enmod -q "php$target" >/dev/null; ok "apache module php$target"; fi
+				reload_list=$(printf '%s\n' "${web_servers[@]}")
+				if $apache_conf || $apache_mod; then reload_list=$(printf '%s\napache\n' "$reload_list"); fi
+				while read -r server; do
+					[ -n "$server" ] || continue
+					if ! web_test "$server" >/dev/null; then web_test "$server" >&2 || true; false; fi
+					web_reload "$server"
+					ok "$server config test passed, reloaded"
+				done < <(sort -u <<< "$reload_list")
+				sleep 1
+			fi
+
+		#7. default cli
+			if $switch_cli; then
+				step "switching /usr/bin/php"
+				set_default_cli "$target"
+				ok "/usr/bin/php -> $(readlink -f /usr/bin/php)"
+			fi
+
+		#8. dependents
+			if [ -n "$dep_units$dep_programs" ]; then
+				step "restarting processes that run php"
+				restart_dependents_now || false
+			fi
+
+		#9. retire the old php-fpm and check
+			if $from_fpm_running && ! $handover && [ "$from" != "$target" ]; then
+				step "stopping $(fpm_service "$from")"
+				systemctl stop "$(fpm_service "$from")"
+			fi
+			if $from_fpm && [ "$from" != "$target" ]; then
+				systemctl disable --quiet "$(fpm_service "$from")" 2>/dev/null || true
+				ok "$(fpm_service "$from") stopped and disabled (packages kept)"
+			fi
+			fix_generic_socket "$target"
+			step "health checks for php $target"
+			if $target_fpm; then probe_pools "$target" || false; fi
+			for i in "${!check_urls[@]}"; do
+				code=$(http_code "${check_urls[$i]}")
+				if [ "$code" = 000 ] || [ "$code" -ge 500 ] || { [ "${baseline[$i]}" -lt 400 ] && [ "$code" -ge 400 ]; }; then
+					fail "${check_urls[$i]} -> $code (was ${baseline[$i]})"
+					false
+				fi
+				ok "${check_urls[$i]} -> $code (was ${baseline[$i]})"
+			done
+			trap - ERR
+			report_journal "$log_since"
+			echo "${c_ok}switched php $from -> php $target${c_off}"
+	}
+
+#undo a switch that failed after step 5 began
+	rollback() {
+		local i server reload_list
+		trap - ERR
+		set +o errexit
+		echo "${c_err}rolling back to php $rb_from${c_off}" >&2
+		for i in "${!rb_web_files[@]}"; do cp -a "$rb_backup${rb_web_files[$i]}" "${rb_web_files[$i]}"; done
+		if $rb_apache_conf; then a2disconf -q "php$rb_target-fpm" >/dev/null 2>&1; a2enconf -q "php$rb_from-fpm" >/dev/null 2>&1; fi
+		if $rb_apache_mod; then a2dismod -q "php$rb_target" >/dev/null 2>&1; a2enmod -q "php$rb_from" >/dev/null 2>&1; fi
+		if $rb_target_fpm && [ "$rb_from" != "$rb_target" ]; then
+			if $rb_handover; then systemctl stop "$(fpm_service "$rb_target")" >/dev/null 2>&1; fi
+			if $rb_from_fpm; then
+				systemctl enable --quiet "$(fpm_service "$rb_from")"
+				systemctl start "$(fpm_service "$rb_from")"
+				wait_pools "$rb_from"
+			fi
+		fi
+		reload_list=$(printf '%s\n' "${rb_web_servers[@]}")
+		if $rb_apache_conf || $rb_apache_mod; then reload_list=$(printf '%s\napache\n' "$reload_list"); fi
+		while read -r server; do
+			[ -n "$server" ] || continue
+			if web_test "$server" >/dev/null 2>&1; then web_reload "$server"; fi
+		done < <(sort -u <<< "$reload_list")
+		if [ "$rb_cli" != none ] && [ "$rb_cli" != unknown ]; then set_default_cli "$rb_cli"; fi
+		if [ -n "$dep_units$dep_programs" ]; then restart_dependents_now >/dev/null 2>&1; fi
+		if $rb_target_fpm && [ "$rb_from" != "$rb_target" ]; then
+			systemctl stop "$(fpm_service "$rb_target")" >/dev/null 2>&1
+			systemctl disable --quiet "$(fpm_service "$rb_target")" 2>/dev/null
+			if $rb_from_fpm; then fix_generic_socket "$rb_from" >/dev/null; fi
+		fi
+		echo "rolled back; backups in $rb_backup" >&2
+		exit 1
+	}
+
+#--- interactive menu ---------------------------------------------------------------------------
+
+#run a command in a subshell with errexit on, recording its status in sub_rc; never call this as
+#part of && / || or as an if condition, because bash then ignores errexit (and the rollback trap)
+#for everything inside it
+	sub_rc=0
+	run_sub() {
+		set +o errexit
+		( set -o errexit; "$@" )
+		sub_rc=$?
+		set -o errexit
+	}
+
+#run a command with colors off, for output shown in a text box
+	plain() {
+		set_colors off
+		"$@"
+	}
+
+#menu settings in /etc/php-switch.conf: check_urls, lint_dirs, restart_dependents (on/off)
+	ui_load() {
+		local key value
+		ui_check_urls=''
+		ui_lint_dirs=''
+		ui_restart=on
+		[ -r "$ui_conf" ] || return 0
+		while IFS='=' read -r key value; do
+			value=${value#\"}
+			value=${value%\"}
+			case "$key" in
+				check_urls) ui_check_urls=$value ;;
+				lint_dirs) ui_lint_dirs=$value ;;
+				restart_dependents) ui_restart=$value ;;
+			esac
+		done < <(grep -E '^[a-z_]+=' "$ui_conf" || true)
+	}
+
+	ui_save() {
+		cat > "$ui_conf" <<EOF
+# php-switch menu settings; written by the menu, read only by the menu
+check_urls="$ui_check_urls"
+lint_dirs="$ui_lint_dirs"
+restart_dependents="$ui_restart"
+EOF
+	}
+
+#whiptail with the selection on stdout
+	wt() {
+		"$whiptail" --backtitle "php-switch $php_switch_version  |  $os_name  |  $(repo_label)" "$@" 3>&1 1>&2 2>&3
+	}
+
+#box sizes from the terminal
+	ui_size() {
+		local lines cols
+		lines=$(tput lines 2>/dev/null || echo 24)
+		cols=$(tput cols 2>/dev/null || echo 80)
+		ui_h=$(( lines - 4 ))
+		ui_w=$(( cols - 8 ))
+		[ "$ui_h" -ge 16 ] || ui_h=16
+		[ "$ui_w" -ge 60 ] || ui_w=60
+		[ "$ui_w" -le 110 ] || ui_w=110
+	}
+
+#show a file in a text box; only output too long for the box scrolls, because whiptail's
+#scrolling box keeps the focus on the text and Enter alone no longer closes it
+	ui_textbox() {
+		local title=$1 file=$2
+		if [ "$(wc -l < "$file")" -gt $(( ui_h - 7 )) ]; then
+			wt --title "$title  (arrows scroll, Tab then Enter closes)" --scrolltext --textbox "$file" "$ui_h" "$ui_w" || true
+		else
+			wt --title "$title" --textbox "$file" "$ui_h" "$ui_w" || true
+		fi
+	}
+
+#show a command's output in a text box
+	ui_show() {
+		local title=$1 out
+		shift
+		out=$(mktemp)
+		run_sub plain "$@" > "$out" 2>&1
+		ui_textbox "$title" "$out"
+		rm -f "$out"
+	}
+
+#run a command on the plain terminal so its progress streams, then wait for Enter
+	ui_run() {
+		local title=$1
+		shift
+		clear 2>/dev/null || true
+		echo "${c_dim}==>${c_off} $title"
+		echo
+		run_sub "$@"
+		echo
+		if [ "$sub_rc" -eq 0 ]; then echo "${c_ok}done${c_off}"; else echo "${c_err}finished with errors (exit $sub_rc)${c_off}"; fi
+		read -r -p "Press Enter to return to the menu " _ || true
+	}
+
+#one line per item for the menu header
+	ui_summary() {
+		local fpm cli
+		fpm=$(running_fpm_versions | tr '\n' ' ')
+		cli=$(default_cli_version)
+		printf 'php-fpm running: %s\n/usr/bin/php: php %s\n\nChoose an action:' "${fpm:-none}" "$cli"
+	}
+
+	ui_plan() {
+		dry_run=true
+		cmd_switch "$1"
+	}
+
+	ui_apply() {
+		dry_run=false
+		assume_yes=true
+		cmd_switch "$1"
+	}
+
+#pick a version, options, check urls; show the plan; apply after confirmation
+	ui_switch() {
+		local items=() version candidate desc on target active installed running count v opts urls dirs plan u d
+		allow_prerelease=false
+		allow_missing_ext=false
+		from_arg=''
+		if [ -z "$(php_sources)" ]; then
+			if wt --title "Repository" --yesno "No $(repo_label) repository is configured, so only the distro's own PHP can be installed.
+
+Add $(repo_label) now?" 12 70; then
+				ui_run "Adding $(repo_label)" repo_add
+			fi
+		fi
+		active=$(running_fpm_versions | tail -1)
+		[ -n "$active" ] || active=$(default_cli_version)
+		installed=" $(installed_versions | tr '\n' ' ') "
+		while IFS=$'\t' read -r version candidate; do
+			desc=$candidate
+			if is_prerelease "$candidate"; then desc="$desc  [prerelease]"; fi
+			case "$installed" in *" $version "*) desc="$desc  (installed)" ;; esac
+			on=OFF
+			if [ "$version" = "$active" ]; then desc="$desc  (active)"; on=ON; fi
+			items+=("$version" "$desc" "$on")
+		done < <(available_versions)
+		if [ "${#items[@]}" -eq 0 ]; then
+			wt --title "Switch PHP version" --msgbox "apt offers no PHP versions. Check the repository from the main menu." 8 70 || true
+			return 0
+		fi
+		target=$(wt --title "Switch PHP version" --radiolist "Active now: php $active
+Space selects a version, Enter continues." "$ui_h" "$ui_w" $(( ui_h - 9 )) "${items[@]}") || return 0
+		[ -n "$target" ] || return 0
+		candidate=$(available_versions | awk -F'\t' -v v="$target" '$1 == v {print $2}')
+		if is_prerelease "$candidate"; then
+			wt --title "Prerelease" --yesno "php $target is a prerelease ($candidate).
+
+Switch to it anyway?" 12 70 || return 0
+			allow_prerelease=true
+		fi
+
+		#several php-fpm running: ask which one this replaces
+			running=$(running_fpm_versions)
+			count=$(grep -c . <<< "$running" || true)
+			if [ "$count" -gt 1 ]; then
+				items=()
+				for v in $running; do items+=("$v" "php$v-fpm is running" OFF); done
+				from_arg=$(wt --title "Switch away from" --radiolist "Several php-fpm versions are running. Which one does php $target replace?" 14 70 "$count" "${items[@]}") || return 0
+				[ -n "$from_arg" ] || return 0
+			fi
+
+		#options
+			opts=$(wt --title "Options" --separate-output --checklist "Space toggles, Enter continues." 14 "$ui_w" 3 \
+				restart "Restart services and supervisor programs that run PHP" "$( [ "$ui_restart" = on ] && echo ON || echo OFF )" \
+				lint "PHP-lint a code directory first; new parse errors stop the switch" "$( [ -n "$ui_lint_dirs" ] && echo ON || echo OFF )" \
+				missing "Continue even if PHP extensions would go missing" OFF) || return 0
+			urls=$(wt --title "Check URLs" --inputbox "URLs that must keep answering after the switch, separated by spaces.
+Leave empty to rely on the php-fpm pool checks alone." 11 "$ui_w" "$ui_check_urls") || return 0
+			dirs=''
+			if grep -x lint <<< "$opts" >/dev/null; then
+				dirs=$(wt --title "Lint" --inputbox "Directories to lint with php $target, separated by spaces." 10 "$ui_w" "$ui_lint_dirs") || return 0
+			fi
+			ui_check_urls=$(tr -d '"' <<< "$urls")
+			ui_lint_dirs=$(tr -d '"' <<< "$dirs")
+			if grep -x restart <<< "$opts" >/dev/null; then ui_restart=on; else ui_restart=off; fi
+			ui_save
+			if [ "$ui_restart" = on ]; then restart_dependents=true; else restart_dependents=false; fi
+			if grep -x missing <<< "$opts" >/dev/null; then allow_missing_ext=true; fi
+			check_urls=()
+			for u in $ui_check_urls; do check_urls+=("$u"); done
+			lint_dirs=()
+			for d in $ui_lint_dirs; do lint_dirs+=("$d"); done
+
+		#plan, then confirm and apply
+			plan=$(mktemp)
+			run_sub plain ui_plan "$target" > "$plan" 2>&1
+			if grep 'is already active' "$plan" >/dev/null; then
+				ui_textbox "Already active" "$plan"
+			elif [ "$sub_rc" -ne 0 ] || ! grep '^switch ' "$plan" >/dev/null; then
+				ui_textbox "Cannot switch to php $target" "$plan"
+			else
+				ui_textbox "Plan" "$plan"
+				if wt --title "Apply" --defaultno --yesno "Apply this switch to php $target now?
+
+If a health check fails, everything is rolled back." 11 70; then
+					ui_run "Switching to php $target" ui_apply "$target"
+				fi
+			fi
+			rm -f "$plan"
+	}
+
+	ui_check() {
+		local urls u
+		urls=$(wt --title "Health check" --inputbox "URLs to check besides the php-fpm pools, separated by spaces. Leave empty for none." 10 "$ui_w" "$ui_check_urls") || return 0
+		check_urls=()
+		for u in $urls; do check_urls+=("$u"); done
+		ui_show "Health check" cmd_check
+	}
+
+	ui_repo() {
+		local items=() choice
+		if [ -z "$(php_sources)" ]; then items+=(add "Add $(repo_label)"); fi
+		items+=(check "Check the repository and its signing key (no changes)")
+		items+=(fix "Check, and repair a missing, expired or broken key")
+		choice=$(wt --title "Repository: $(repo_label)" --menu "" 13 "$ui_w" 3 "${items[@]}") || return 0
+		case "$choice" in
+			add) ui_run "Adding $(repo_label)" repo_add ;;
+			check) ui_show "Repository check" repo_check check ;;
+			fix) ui_run "Repository check and repair" repo_check fix ;;
+		esac
+	}
+
+	ui_settings() {
+		local urls dirs
+		urls=$(wt --title "Settings" --inputbox "Default check URLs for switches and health checks, separated by spaces." 10 "$ui_w" "$ui_check_urls") || return 0
+		dirs=$(wt --title "Settings" --inputbox "Default directories to lint before a switch, separated by spaces. Empty turns linting off." 10 "$ui_w" "$ui_lint_dirs") || return 0
+		ui_check_urls=$(tr -d '"' <<< "$urls")
+		ui_lint_dirs=$(tr -d '"' <<< "$dirs")
+		if wt --title "Settings" --yesno "Restart services and supervisor programs that run PHP after a switch?" 9 70; then ui_restart=on; else ui_restart=off; fi
+		ui_save
+		wt --title "Settings" --msgbox "Saved to $ui_conf" 8 60 || true
+	}
+
+	cmd_menu() {
+		local choice
+		[ "$(id -u)" = 0 ] || die "the menu needs root: sudo php-switch"
+		if ! has "$whiptail"; then
+			echo "installing whiptail for the menu"
+			pkg_install whiptail
+		fi
+		ui_load
+		while true; do
+			ui_size
+			choice=$(wt --title "php-switch" --notags --menu "$(ui_summary)" "$ui_h" "$ui_w" 8 \
+				switch "Switch PHP version" \
+				status "Status: installed versions and what is active" \
+				services "Services and programs running PHP" \
+				check "Health check" \
+				repo "Repository and signing key" \
+				versions "Versions available to install" \
+				settings "Settings" \
+				quit "Quit") || break
+			case "$choice" in
+				switch) ui_switch ;;
+				status) ui_show "Status" cmd_status ;;
+				services) ui_show "Services running PHP" cmd_services ;;
+				check) ui_check ;;
+				repo) ui_repo ;;
+				versions) ui_show "Versions available to install" cmd_list ;;
+				settings) ui_settings ;;
+				*) break ;;
+			esac
+		done
+		clear 2>/dev/null || true
+	}
+
+#--- main ---------------------------------------------------------------------------------------
+
+#parse arguments; no command opens the menu on a terminal and shows the status otherwise
+	if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+		command=menu
+	else
+		command=${1:-status}
+	fi
+	if [ $# -gt 0 ]; then shift; fi
+	version_arg=''
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-y|--yes) assume_yes=true ;;
+			-n|--dry-run) dry_run=true ;;
+			--check) check_only=true ;;
+			--from) from_arg=${2:?--from needs a version}; shift ;;
+			--lint) lint_dirs+=("${2:?--lint needs a directory}"); shift ;;
+			--check-url) check_urls+=("${2:?--check-url needs a url}"); shift ;;
+			--allow-prerelease) allow_prerelease=true ;;
+			--allow-missing-ext) allow_missing_ext=true ;;
+			--no-restart) restart_dependents=false ;;
+			-h|--help) command=help ;;
+			-*) die "unknown option $1" ;;
+			*) version_arg=$1 ;;
+		esac
+		shift
+	done
+
+#run the command
+	if [ "$command" = help ] || [ "$command" = -h ] || [ "$command" = --help ]; then
+		awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
+		exit 0
+	fi
+	if [ "$command" = version ] || [ "$command" = --version ]; then
+		echo "php-switch $php_switch_version"
+		exit 0
+	fi
+	detect_platform
+	case "$command" in
+		menu) cmd_menu ;;
+		status) cmd_status ;;
+		list) cmd_list ;;
+		repo) cmd_repo ;;
+		services) cmd_services ;;
+		check) cmd_check ;;
+		switch)
+			[ -n "$version_arg" ] || die "usage: php-switch switch <x.y|latest> [options]"
+			cmd_switch "$version_arg"
+			;;
+		*) die "unknown command $command (menu, status, list, repo, services, check, switch, version)" ;;
+	esac
